@@ -1,3 +1,11 @@
+> **This is castr's branch of doubletake.** [castr](https://github.com/mrCode/castr)
+> builds it as its own AirPlay helper, `/usr/lib/castr/castr-airplay`, from the
+> `castr-airplay-*` tags here. It is upstream
+> [omarroth/doubletake](https://github.com/omarroth/doubletake) plus fixes castr
+> needs, each offered upstream first: receiver authentication is
+> [omarroth/doubletake#67](https://github.com/omarroth/doubletake/pull/67). For
+> doubletake itself, use upstream.
+
 # doubletake
 
 AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay mirroring protocol.
