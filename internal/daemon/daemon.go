@@ -892,45 +892,62 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	if suppliedCredential != "" {
 		credential = suppliedCredential
 	}
+	var binding airplay.AddressBinding
 	if expectedDeviceID == "" {
-		// What discovery advertised for this address, before this connection.
+		// The receiver last paired at this address, before what discovery
+		// advertised for it: anyone on the network can advertise a record
+		// with this IP, so a record naming another receiver is refused while
+		// the one paired here has a pairing.
+		var err error
+		if binding, err = d.credStore.BindingAt(target); err != nil {
+			removeStream(fmt.Sprintf("%v; refusing to cast", err))
+			return
+		}
+		discovered := ""
 		d.mu.Lock()
 		for _, device := range d.devices {
 			if device.IP == target {
-				expectedDeviceID = device.DeviceID
+				discovered = device.DeviceID
 				break
 			}
 		}
 		d.mu.Unlock()
-	}
-	boundByAddress := false
-	if expectedDeviceID == "" {
-		// Or the receiver last paired at this address.
-		bound, tied, err := d.credStore.ReceiverAtAddress(target)
-		if err != nil {
-			removeStream(fmt.Sprintf("%v; refusing to cast", err))
+		switch {
+		case !binding.Bound():
+			expectedDeviceID = discovered
+		case discovered != "" && !binding.Admits(discovered):
+			paired := binding.DeviceID
+			if paired == "" {
+				paired = strings.Join(binding.Tied, " and ")
+			}
+			removeStream(fmt.Sprintf("discovery advertises %q at %s, but this machine paired with %s there; "+
+				"refusing to cast. If a different receiver now has that address, pair with it explicitly "+
+				"by connecting with its device_id.", discovered, target, paired))
 			return
+		default:
+			// After a tie the receiver meant is whichever tied one answers.
+			expectedDeviceID = binding.DeviceID
 		}
-		if len(tied) > 0 {
-			log.Printf("[daemon] warning: the saved pairings for %s were all made at %s at the same time; "+
-				"not taking any of them as the receiver there", strings.Join(tied, " and "), target)
-		}
-		expectedDeviceID, boundByAddress = bound, bound != ""
 	}
-	// A receiver this machine holds a proven identity for must prove it again
-	// before the credential goes anywhere: the client answers any 401 with an
-	// MD5 Digest of it, crackable offline when the code is short, and a device
-	// at the address can challenge before pair-verify. So the password is
-	// installed only once the receiver has proven itself.
-	holdPassword := false
+	boundByAddress := binding.Bound()
+	// A receiver this machine has paired with must prove itself before the
+	// credential goes anywhere: the client answers any 401 with an MD5 Digest
+	// of it, crackable offline when the code is short, and a device at the
+	// address can challenge before pair-verify. So the password is installed
+	// only once the receiver has proven itself -- also for a pairing saved
+	// before receiver identities, which proves itself by pairing again.
+	holdPassword := boundByAddress
 	if expectedDeviceID != "" {
 		expected, err := d.credStore.LookupReceiver(expectedDeviceID, expectedDeviceID)
 		if err != nil {
 			removeStream(fmt.Sprintf("%v; refusing to cast", err))
 			return
 		}
-		holdPassword = expected.HasReceiverIdentity()
+		holdPassword = expected.HasPairingCredentials()
 	}
+	// proven: the receiver has shown it is the one paired with, by
+	// pair-verify against its saved identity or by pairing with a code.
+	proven := false
 	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
 		var next *airplay.AirPlayClient
 		d.mu.Lock()
@@ -986,8 +1003,14 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	deviceID := info.DeviceID
-	if expectedDeviceID == "" {
+	if expectedDeviceID == "" && !boundByAddress {
 		log.Printf("[daemon] warning: no device_id for %s and none discovered; a device there naming itself as a new receiver would be paired with from scratch", target)
+	}
+	if expectedDeviceID == "" && boundByAddress {
+		if expectedDeviceID, err = binding.ReceiverMeant(deviceID); err != nil {
+			removeStream(fmt.Sprintf("%v; refusing to cast", err))
+			return
+		}
 	}
 	savedCreds, err := d.credStore.LookupReceiver(expectedDeviceID, deviceID)
 	if err != nil {
@@ -1004,7 +1027,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	if savedCreds != nil {
 		screenCastRestoreToken = savedCreds.RestoreToken
 	}
-	if savedCreds.HasReceiverIdentity() && !holdPassword {
+	if savedCreds.HasPairingCredentials() && !holdPassword {
 		// Found only by the ID the device reported; it still proves itself
 		// before the password is used again.
 		holdPassword = true
@@ -1095,7 +1118,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	paired := false
 	// Once this machine has paired with a receiver, nothing falls back to
 	// transient pairing for it; airplay.AfterSavedPairing says why.
-	mustPairWithCode := false
+	mustPairWithCode, mustPairRaw := false, false
 	if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		var verifyErr error
 		step := airplay.AfterSavedPairing(savedCreds, func() error {
@@ -1107,8 +1130,13 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		})
 		switch step {
 		case airplay.SavedPairingVerified:
-			paired = true
+			paired, proven = true, true
 			log.Printf("[daemon] pair-verify succeeded for %s", info.Name)
+			// Proven at this address: a pairing saved before addresses were
+			// recorded is bound to it from now on.
+			if err := d.credStore.BindAddress(target, deviceID, expectedDeviceID); err != nil {
+				log.Printf("[daemon] warning: failed to record the address of %s: %v", info.Name, err)
+			}
 		case airplay.SavedPairingRefuse:
 			if errors.Is(verifyErr, airplay.ErrReceiverNotAuthenticated) {
 				removeStream(fmt.Sprintf("%s did not prove it is the receiver this machine paired with "+
@@ -1132,6 +1160,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 				log.Printf("[daemon] saved pairing for %s predates receiver authentication; pairing again", info.Name)
 			}
 			mustPairWithCode = step == airplay.SavedPairingPairWithCode
+			mustPairRaw = step == airplay.SavedPairingPairAsNew
 		}
 	} else if savedCreds != nil {
 		log.Printf("[daemon] saved credentials have no usable pair-verify keys, skipping")
@@ -1182,12 +1211,23 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			if err != nil {
 				return fmt.Errorf("pairing again: %w", err)
 			}
+			proven = true
 			savePairing(kind)
 			return nil
 		}
 		if mustPairWithCode {
 			if err := pairAgainWithCode(); err != nil {
 				removeStream(err.Error())
+				return
+			}
+		} else if mustPairRaw {
+			// A raw pairing made before receiver identities: raw again, with
+			// no code and no fallback; airplay.PairAgainRaw says why. Not
+			// saved over the old entry: raw receivers need not remember a
+			// raw pairing, and one that no longer verifies is refused for
+			// good, while the old entry keeps the code held back.
+			if err := client.PairAgainRaw(ctx); err != nil {
+				removeStream(fmt.Sprintf("%v; refusing to cast", err))
 				return
 			}
 		} else {
@@ -1228,10 +1268,14 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		}
 	}
 
-	// The receiver has proven itself -- by pair-verify against its saved
-	// identity, or by pairing with a code -- or none was held for it.
-	holdPassword = false
-	client.SetPassword(credential)
+	// Installed once the receiver has proven itself, or when none was held
+	// for it. A raw pairing proves nothing, so a raw receiver paired with
+	// again keeps the password back until it verifies against the key it
+	// gave, next time.
+	if proven || !holdPassword {
+		holdPassword = false
+		client.SetPassword(credential)
+	}
 
 	// A configured playback password is independent from pair-verify. A saved or
 	// transient pairing may succeed without it, but SETUP will later issue a

@@ -188,34 +188,36 @@ func main() {
 	if expectedID == "" && advertisement != nil {
 		expectedID = advertisement.DeviceID
 	}
-	boundByAddress := false
+	var binding airplay.AddressBinding
 	if expectedID == "" && *target != "" && !*forcePair {
 		// With -pair the user is pairing deliberately with whatever is at the
 		// address now, so the receiver paired there before does not refuse
 		// it; the new pairing takes the address over.
-		bound, tied, err := credStore.ReceiverAtAddress(addr)
+		binding, err = credStore.BindingAt(addr)
 		if err != nil {
 			log.Fatalf("%v; refusing to cast", err)
 		}
-		if len(tied) > 0 {
-			log.Printf("warning: the saved pairings for %s were all made at %s at the same time; "+
-				"not taking any of them as the receiver there", strings.Join(tied, " and "), addr)
-		}
-		expectedID, boundByAddress = bound, bound != ""
+		// After a tie the receiver meant is whichever tied one answers.
+		expectedID = binding.DeviceID
 	}
-	// A receiver this machine holds a proven identity for must prove it again
-	// before the code goes anywhere: the client answers any 401 with an MD5
-	// Digest of it, crackable offline when the code is short, and a device
-	// at the address can challenge before pair-verify. So the password is
-	// installed only once the receiver has proven itself.
-	holdPassword := false
+	boundByAddress := binding.Bound()
+	// A receiver this machine has paired with must prove itself before the
+	// code goes anywhere: the client answers any 401 with an MD5 Digest of
+	// it, crackable offline when the code is short, and a device at the
+	// address can challenge before pair-verify. So the password is installed
+	// only once the receiver has proven itself -- also for a pairing saved
+	// before receiver identities, which proves itself by pairing again.
+	holdPassword := boundByAddress
 	if expectedID != "" {
 		expected, err := credStore.LookupReceiver(expectedID, expectedID)
 		if err != nil {
 			log.Fatalf("%v; refusing to cast", err)
 		}
-		holdPassword = expected.HasReceiverIdentity()
+		holdPassword = expected.HasPairingCredentials()
 	}
+	// proven: the receiver has shown it is the one paired with, by
+	// pair-verify against its saved identity or by pairing with a code.
+	proven := false
 	installPassword := func() {
 		if !holdPassword {
 			client.SetPassword(credential)
@@ -257,8 +259,13 @@ func main() {
 
 	// Looked up even for -pair: a receiver this machine has paired with is
 	// paired with again only with a code, never transiently.
-	if expectedID == "" {
+	if expectedID == "" && !boundByAddress {
 		log.Printf("warning: no -device-id; a device at %s naming itself as a new receiver would be paired with from scratch", addr)
+	}
+	if expectedID == "" && boundByAddress {
+		if expectedID, err = binding.ReceiverMeant(info.DeviceID); err != nil {
+			log.Fatalf("%v; refusing to cast", err)
+		}
 	}
 	savedCreds, err := credStore.LookupReceiver(expectedID, info.DeviceID)
 	if err != nil {
@@ -270,7 +277,7 @@ func main() {
 		log.Fatalf("%v; refusing to cast", err)
 	}
 	pairedWithCode := savedCreds.HasPairingCredentials() && !savedCreds.UsesRawPairing()
-	if savedCreds.HasReceiverIdentity() && !holdPassword {
+	if savedCreds.HasPairingCredentials() && !holdPassword {
 		// Found only by the ID the device reported; it still proves itself
 		// before the password is used again.
 		holdPassword = true
@@ -387,7 +394,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("pairing failed: %v", err)
 		}
+		proven = true
 		savePairingCredentials(kind)
+	}
+	// pairAgainRaw pairs again with a receiver whose saved pairing is a raw
+	// one made before receiver identities: raw, with no code and no
+	// fallback; airplay.PairAgainRaw says why. The pairing is not saved over
+	// the old one, as it was not before: raw receivers need not remember a
+	// raw pairing, and a saved one that no longer verifies is refused for
+	// good, while the old entry keeps marking this receiver as one paired
+	// with, so the code stays held back from it.
+	pairAgainRaw := func() {
+		if err := client.PairAgainRaw(ctx); err != nil {
+			log.Fatalf("%v; refusing to cast", err)
+		}
 	}
 	if needFullPair && pairedWithCode {
 		pairAgainWithCode(true)
@@ -431,7 +451,16 @@ func main() {
 				"pairing with an unauthenticated one. If you reset or replaced that receiver, "+
 				"remove its entry from %s and connect again.", verifyErr, *credFile)
 		}
-		if step != airplay.SavedPairingVerified {
+		if step == airplay.SavedPairingVerified {
+			proven = true
+			if *target != "" {
+				// Proven at this address: a pairing saved before addresses
+				// were recorded is bound to it from now on.
+				if err := credStore.BindAddress(addr, info.DeviceID, expectedID); err != nil {
+					log.Printf("warning: failed to record the receiver's address: %v", err)
+				}
+			}
+		} else {
 			if verifyErr != nil {
 				log.Printf("pair-verify with saved creds failed: %v", verifyErr)
 				reconnect()
@@ -439,7 +468,7 @@ func main() {
 				log.Printf("saved credentials predate receiver authentication; pairing again")
 			}
 			if step == airplay.SavedPairingPairAsNew {
-				pairFresh()
+				pairAgainRaw()
 			} else {
 				pairAgainWithCode(false)
 			}
@@ -447,10 +476,14 @@ func main() {
 	} else {
 		pairFresh()
 	}
-	// The receiver has proven itself -- by pair-verify against its saved
-	// identity, or by pairing with a code -- or none was held for it.
-	holdPassword = false
-	installPassword()
+	// Installed once the receiver has proven itself, when none was held for
+	// it, or when -pair asked to pair with whatever is at the address. A raw
+	// pairing proves nothing, so a raw receiver paired with again keeps the
+	// password back until it verifies against the key it gave, next time.
+	if proven || !holdPassword || needFullPair {
+		holdPassword = false
+		installPassword()
+	}
 	log.Println("pairing complete")
 
 	// FairPlay setup — establishes fp-setup state and ekey/eiv used for the

@@ -188,19 +188,33 @@ func savedPairingDaemon(t *testing.T, code airplay.PairingCode) *Daemon {
 // savedPairingDaemonAt is savedPairingDaemon with the pairing made at address.
 func savedPairingDaemonAt(t *testing.T, code airplay.PairingCode, address string) *Daemon {
 	t.Helper()
+	entry := savedPairingEntry(code, true)
+	entry.ReceiverAddress = address
+	return daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
+}
+
+// savedPairingEntry is a HAP pairing made earlier, with or without the
+// receiver identity that pairings saved before identities lack.
+func savedPairingEntry(code airplay.PairingCode, withIdentity bool) *airplay.SavedCredentials {
 	own := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x42}, ed25519.SeedSize))
 	receiver := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x51}, ed25519.SeedSize))
-	entries := map[string]*airplay.SavedCredentials{savedPairingDeviceID: {
-		PairingID:         "12345678-1234-4234-8234-123456789abc",
-		Ed25519Public:     own.Public().(ed25519.PublicKey),
-		Ed25519Seed:       own.Seed(),
-		PairingProtocol:   airplay.PairingProtocolHAP,
-		ReceiverID:        "receiver-test-id",
-		ReceiverPublicKey: receiver.Public().(ed25519.PublicKey),
-		PairingCode:       code,
-		ReceiverAddress:   address,
-		PairedAt:          "2026-10-01T10:00:00Z",
-	}}
+	entry := &airplay.SavedCredentials{
+		PairingID:       "12345678-1234-4234-8234-123456789abc",
+		Ed25519Public:   own.Public().(ed25519.PublicKey),
+		Ed25519Seed:     own.Seed(),
+		PairingProtocol: airplay.PairingProtocolHAP,
+		PairingCode:     code,
+		PairedAt:        "2026-10-01T10:00:00Z",
+	}
+	if withIdentity {
+		entry.ReceiverID = "receiver-test-id"
+		entry.ReceiverPublicKey = receiver.Public().(ed25519.PublicKey)
+	}
+	return entry
+}
+
+func daemonWithEntries(t *testing.T, entries map[string]*airplay.SavedCredentials) *Daemon {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	data, err := json.Marshal(entries)
 	if err != nil {
@@ -480,5 +494,314 @@ func TestDaemonRefusesADeviceAtABoundAddressNamingItselfAnew(t *testing.T) {
 		if request.path != "/info" {
 			t.Fatalf("sent %s %s to a device refused at a bound address", request.method, request.path)
 		}
+	}
+}
+
+func connectByAddress(t *testing.T, d *Daemon, device *savedPairingDevice) {
+	t.Helper()
+	port := device.listener.Addr().(*net.TCPAddr).Port
+	if response := d.handleConnect(Request{Cmd: "connect", Target: "127.0.0.1", Port: port}); !response.OK {
+		t.Fatalf("connect rejected: %+v", response)
+	}
+}
+
+func onlyInfoSent(t *testing.T, device *savedPairingDevice) {
+	t.Helper()
+	for _, request := range device.seen() {
+		if request.path != "/info" {
+			t.Fatalf("sent %s %s to a refused device", request.method, request.path)
+		}
+	}
+}
+
+// A code-made pairing saved before receiver identities still names a
+// receiver this machine paired with: the preset code is held back.
+func TestDaemonSendsNoDigestForAPairingSavedBeforeIdentities(t *testing.T) {
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		return 401, digestChallengeHeaders, nil
+	})
+	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{
+		savedPairingDeviceID: savedPairingEntry(airplay.PairingCodeNone, false),
+	})
+	connectSavedPairing(t, d, device)
+	waitForSavedPairingError(t, d)
+	if len(device.seen()) == 0 {
+		t.Fatal("the device was never asked anything")
+	}
+	device.requireNoAuthorization(t)
+}
+
+// A raw pairing saved before identities is paired with again raw only.
+func TestDaemonPairsARawPairingBeforeIdentitiesAgainOnlyRaw(t *testing.T) {
+	info := savedPairingInfo(t, savedPairingLegacyFeatures, 1<<7)
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		if path == "/info" {
+			return 200, map[string]string{"Content-Type": "application/x-apple-binary-plist"}, info
+		}
+		return 401, digestChallengeHeaders, nil
+	})
+	entry := savedPairingEntry(airplay.PairingCodeNone, false)
+	entry.PairingProtocol = airplay.PairingProtocolRaw
+	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
+	connectSavedPairing(t, d, device)
+	failure := waitForSavedPairingError(t, d)
+	if !strings.Contains(failure, "remove its entry from the credentials file") {
+		t.Fatalf("failure = %q, want advice to remove the entry", failure)
+	}
+	onlyInfoSent(t, device)
+	device.requireNoAuthorization(t)
+}
+
+// The real raw receiver is paired with again, raw, and the session goes on.
+// The old entry is kept as it was.
+func TestDaemonRawPairingBeforeIdentitiesPairsAgainRaw(t *testing.T) {
+	server := startDaemonTestReceiver(t, airplay.ReceiverConfig{Profile: airplay.ReceiverProfileAppleTV3})
+	entry := savedPairingEntry(airplay.PairingCodeNone, false)
+	entry.PairingProtocol = airplay.PairingProtocolRaw
+	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
+	addr := server.Addr().(*net.TCPAddr)
+	if response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
+		DeviceID: savedPairingDeviceID}); !response.OK {
+		t.Fatalf("connect rejected: %+v", response)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for server.Stats().FairPlayRequests == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stats := server.Stats(); stats.FairPlayRequests == 0 || stats.PairSetup != 1 || stats.PINStarts != 0 {
+		t.Fatalf("receiver stats %+v, want one raw pair-setup and the session going on; %+v", stats, d.handleStatus())
+	}
+	store, err := airplay.NewCredentialStore(d.cfg.CredFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved := store.Lookup(savedPairingDeviceID); !saved.UsesRawPairing() || saved.HasReceiverIdentity() {
+		t.Fatalf("the saved raw pairing changed: %+v", saved)
+	}
+}
+
+// An mDNS record with the bound IP can be advertised by anyone; the receiver
+// paired at the address comes first.
+func TestDaemonRefusesADiscoveredIDOtherThanTheBoundReceiver(t *testing.T) {
+	info := savedPairingInfo(t, savedPairingModernFeatures, 0)
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		if path == "/info" {
+			return 200, map[string]string{"Content-Type": "application/x-apple-binary-plist"}, info
+		}
+		return 401, digestChallengeHeaders, nil
+	})
+	d := savedPairingDaemonAt(t, airplay.PairingCodePIN, "127.0.0.1")
+	d.mu.Lock()
+	d.devices = []airplay.AirPlayDevice{{Name: "Impostor", IP: "127.0.0.1", Port: 7000, DeviceID: "11:22:33:44:55:66"}}
+	d.mu.Unlock()
+	connectByAddress(t, d, device)
+	failure := waitForSavedPairingError(t, d)
+	if !strings.Contains(failure, "discovery advertises") || !strings.Contains(failure, savedPairingDeviceID) {
+		t.Fatalf("failure = %q, want a refusal naming the receiver paired at the address", failure)
+	}
+	if n := len(device.seen()); n != 0 {
+		t.Fatalf("connected to the address (%d requests) although discovery contradicts the binding", n)
+	}
+}
+
+// A discovery record that agrees with the binding is no reason to refuse.
+func TestDaemonAcceptsADiscoveredIDMatchingTheBoundReceiver(t *testing.T) {
+	info := savedPairingInfo(t, savedPairingModernFeatures, 0)
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		if path == "/info" {
+			return 200, map[string]string{"Content-Type": "application/x-apple-binary-plist"}, info
+		}
+		return 401, digestChallengeHeaders, nil
+	})
+	d := savedPairingDaemonAt(t, airplay.PairingCodePIN, "127.0.0.1")
+	d.mu.Lock()
+	d.devices = []airplay.AirPlayDevice{{Name: "Living Room", IP: "127.0.0.1", Port: 7000, DeviceID: strings.ToLower(savedPairingDeviceID)}}
+	d.mu.Unlock()
+	connectByAddress(t, d, device)
+	failure := waitForSavedPairingError(t, d)
+	if strings.Contains(failure, "discovery advertises") {
+		t.Fatalf("refused a discovery record that names the bound receiver: %q", failure)
+	}
+	if device.count("/pair-verify") == 0 {
+		t.Fatalf("the bound receiver was not asked to prove itself: %q", failure)
+	}
+	device.requireNoAuthorization(t)
+}
+
+// After a tie at the address, a receiver that is neither tied one is refused.
+func TestDaemonRefusesAThirdReceiverAtATiedAddress(t *testing.T) {
+	info, err := plist.Marshal(map[string]any{
+		"name": "Impostor", "model": "AppleTV-Test", "deviceID": "11:22:33:44:55:66",
+		"features": savedPairingModernFeatures, "statusFlags": uint64(0),
+	}, plist.BinaryFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		if path == "/info" {
+			return 200, map[string]string{"Content-Type": "application/x-apple-binary-plist"}, info
+		}
+		return 500, nil, nil
+	})
+	first, second := savedPairingEntry(airplay.PairingCodePIN, true), savedPairingEntry(airplay.PairingCodePIN, true)
+	first.ReceiverAddress, second.ReceiverAddress = "127.0.0.1", "127.0.0.1"
+	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: first, "AA:BB:CC:DD:EE:02": second})
+	connectByAddress(t, d, device)
+	failure := waitForSavedPairingError(t, d)
+	if !strings.Contains(failure, savedPairingDeviceID) || !strings.Contains(failure, "AA:BB:CC:DD:EE:02") ||
+		!strings.Contains(failure, "remove the stale entry") {
+		t.Fatalf("failure = %q, want a refusal naming both tied receivers", failure)
+	}
+	onlyInfoSent(t, device)
+}
+
+// A pairing saved before addresses were recorded is bound to the address
+// once the receiver proves its saved identity there.
+func TestDaemonBindsAProvenReceiverToItsAddress(t *testing.T) {
+	server := startDaemonTestReceiver(t, airplay.ReceiverConfig{Profile: airplay.ReceiverProfileModern,
+		Auth: airplay.ReceiverAuthPIN, Code: "4827"})
+	addr := server.Addr().(*net.TCPAddr)
+	credFile := filepath.Join(t.TempDir(), "credentials.json")
+	first, err := New(Config{CredBackend: "file", CredFile: credFile, NoAudio: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(first.Shutdown)
+	if response := first.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port}); !response.OK {
+		t.Fatalf("connect rejected: %+v", response)
+	}
+	pinFlowWaitForState(t, first, StatePINRequired)
+	first.handleConnect(Request{Cmd: "connect", Pin: "4827"})
+	waitForSaved(t, first, func(entry *airplay.SavedCredentials) bool { return entry.HasReceiverIdentity() })
+	first.Shutdown()
+
+	// As saved before receiver_address existed.
+	var entries map[string]*airplay.SavedCredentials
+	data, err := os.ReadFile(credFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	entries[savedPairingDeviceID].ReceiverAddress = ""
+	data, _ = json.Marshal(entries)
+	if err := os.WriteFile(credFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := New(Config{CredBackend: "file", CredFile: credFile, NoAudio: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(second.Shutdown)
+	before := server.Stats()
+	if response := second.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
+		DeviceID: savedPairingDeviceID}); !response.OK {
+		t.Fatalf("connect rejected: %+v", response)
+	}
+	waitForSaved(t, second, func(entry *airplay.SavedCredentials) bool { return entry.ReceiverAddress == addr.IP.String() })
+	if server.Stats().PairSetup != before.PairSetup {
+		t.Fatal("the second connect paired again instead of verifying")
+	}
+}
+
+// Nothing is bound after a pair-verify that did not prove the receiver.
+func TestDaemonDoesNotBindAnUnprovenReceiver(t *testing.T) {
+	info := savedPairingInfo(t, savedPairingModernFeatures, 0)
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		switch path {
+		case "/info":
+			return 200, map[string]string{"Content-Type": "application/x-apple-binary-plist"}, info
+		case "/pair-verify":
+			return 200, map[string]string{"Content-Type": "application/octet-stream"}, pairVerifyRefusedBody
+		}
+		return 500, nil, nil
+	})
+	d := savedPairingDaemon(t, airplay.PairingCodePIN)
+	connectSavedPairing(t, d, device)
+	waitForSavedPairingError(t, d)
+	store, err := airplay.NewCredentialStore(d.cfg.CredFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Lookup(savedPairingDeviceID).ReceiverAddress; got != "" {
+		t.Fatalf("an unproven device's address %q was bound to the receiver", got)
+	}
+}
+
+func startDaemonTestReceiver(t *testing.T, cfg airplay.ReceiverConfig) *airplay.ReceiverServer {
+	t.Helper()
+	cfg.ListenAddress = "127.0.0.1:0"
+	cfg.DeviceID = savedPairingDeviceID
+	cfg.Logger = log.New(io.Discard, "", 0)
+	server, err := airplay.NewReceiverServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Close()
+		<-served
+	})
+	return server
+}
+
+// waitForSaved waits for the daemon's saved entry for the test receiver to
+// satisfy ok.
+func waitForSaved(t *testing.T, d *Daemon, ok func(*airplay.SavedCredentials) bool) *airplay.SavedCredentials {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// Read from disk: the daemon's own entries are in use by it.
+		if store, err := airplay.NewCredentialStore(d.cfg.CredFile); err == nil {
+			if entry := store.Lookup(savedPairingDeviceID); entry != nil && ok(entry) {
+				return entry
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the saved entry never got there; status %+v", d.handleStatus())
+	return nil
+}
+
+// Before /info says which tied receiver answers, the address still names
+// receivers this machine paired with: the password is held back.
+func TestDaemonSendsNoDigestBeforeATiedAddressSaysWhoAnswers(t *testing.T) {
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		return 401, digestChallengeHeaders, nil
+	})
+	first, second := savedPairingEntry(airplay.PairingCodePIN, true), savedPairingEntry(airplay.PairingCodePIN, true)
+	first.ReceiverAddress, second.ReceiverAddress = "127.0.0.1", "127.0.0.1"
+	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: first, "AA:BB:CC:DD:EE:02": second})
+	connectByAddress(t, d, device)
+	waitForSavedPairingError(t, d)
+	if len(device.seen()) == 0 {
+		t.Fatal("the device was never asked anything")
+	}
+	device.requireNoAuthorization(t)
+}
+
+// A raw pairing proves nothing, so a raw receiver paired with again does not
+// get the preset code for its Digest: only a receiver that has proven itself
+// does.
+func TestDaemonRawRepairDoesNotReleaseThePresetCode(t *testing.T) {
+	server := startDaemonTestReceiver(t, airplay.ReceiverConfig{Profile: airplay.ReceiverProfileAppleTV3,
+		Auth: airplay.ReceiverAuthDigest, Code: "preset-code", HidePasswordStatus: true})
+	entry := savedPairingEntry(airplay.PairingCodeNone, false)
+	entry.PairingProtocol = airplay.PairingProtocolRaw
+	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
+	addr := server.Addr().(*net.TCPAddr)
+	if response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
+		DeviceID: savedPairingDeviceID}); !response.OK {
+		t.Fatalf("connect rejected: %+v", response)
+	}
+	failure := waitForSavedPairingError(t, d)
+	stats := server.Stats()
+	if stats.PairSetup != 1 || stats.DigestChallenges == 0 || !strings.Contains(failure, "requires a code or password") {
+		t.Fatalf("failure = %q (%+v), want a raw pairing and then a stop at the Digest challenge", failure, stats)
 	}
 }

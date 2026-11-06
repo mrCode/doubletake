@@ -777,15 +777,361 @@ func TestNewestPairingAtAnAddressIsTheReceiverMeant(t *testing.T) {
 			t.Fatalf("the newest pairing at the address was not the receiver meant:\n%s", run.output)
 		}
 	})
-	t.Run("tie", func(t *testing.T) {
+	// A tie fails closed: either tied receiver may answer, a fresh ID may
+	// not -- it used to be paired with from scratch.
+	t.Run("tie, a third receiver answers", func(t *testing.T) {
 		tie := boundEntry()
 		credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
 			boundDeviceID: boundEntry(), "11:22:33:44:55:01": tie,
 		})
 		run := runCLI(t, receiver, credFile, "", "")
-		if !strings.Contains(run.output, boundDeviceID) || !strings.Contains(run.output, "11:22:33:44:55:01") ||
-			!strings.Contains(run.output, "warning: no -device-id") {
-			t.Fatalf("a tie did not warn, naming both, and fall back to no binding:\n%s", run.output)
+		if run.err == nil || !strings.Contains(run.output, boundDeviceID) || !strings.Contains(run.output, "11:22:33:44:55:01") ||
+			!strings.Contains(run.output, "remove the stale entry") {
+			t.Fatalf("a tie did not refuse a third receiver, naming both tied ones:\n%s", run.output)
+		}
+		if strings.Contains(run.output, "warning: no -device-id") {
+			t.Fatalf("a tie fell back to no binding:\n%s", run.output)
+		}
+		for _, request := range receiver.seen() {
+			if request.path != "/info" {
+				t.Fatalf("sent %s %s to a device that is neither tied receiver", request.method, request.path)
+			}
 		}
 	})
+}
+
+// A tied receiver answering as itself is the receiver meant, and like any
+// bound receiver must prove itself before the password goes anywhere.
+func TestTiedReceiverAtAnAddressMustProveItself(t *testing.T) {
+	const tiedID = "11:22:33:44:55:01"
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		if request.path == "/info" && request.conn == 0 {
+			return infoResponse(t, tiedID, modernTestFeatures, 0)
+		}
+		return digestChallenge()
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
+		boundDeviceID: boundEntry(), tiedID: boundEntry(),
+	})
+	run := runCLI(t, receiver, credFile, presetCode, "")
+	if run.err == nil {
+		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	}
+	if strings.Contains(run.output, "remove the stale entry") || strings.Contains(run.output, "warning: no -device-id") {
+		t.Fatalf("a tied receiver answering as itself was not taken as the receiver meant:\n%s", run.output)
+	}
+	if countPath(receiver.seen(), "/pair-verify") == 0 {
+		t.Fatalf("the tied receiver was not asked to prove itself:\n%s", run.output)
+	}
+	requireNoAuthorization(t, receiver.seen())
+}
+
+// Before /info says which tied receiver answers, the address still names
+// receivers this machine paired with: the password is held back.
+func TestNoDigestBeforeATiedAddressSaysWhoAnswers(t *testing.T) {
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		return digestChallenge()
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
+		boundDeviceID: boundEntry(), "11:22:33:44:55:01": boundEntry(),
+	})
+	run := runCLI(t, receiver, credFile, presetCode, "")
+	if run.err == nil {
+		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	}
+	if len(receiver.seen()) == 0 {
+		t.Fatal("the device was never asked anything")
+	}
+	requireNoAuthorization(t, receiver.seen())
+}
+
+// A code-made pairing saved before receiver identities has nothing to verify
+// against, but the receiver meant is still one this machine paired with: the
+// preset code is held back from whatever answers until it pairs again with a
+// code.
+func TestNoDigestForAPairingSavedBeforeIdentities(t *testing.T) {
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		if request.path == "/info" && request.headers["authorization"] == "" {
+			return digestChallenge()
+		}
+		if request.path == "/info" {
+			return infoResponse(t, testReceiverDeviceID, modernTestFeatures, 0)
+		}
+		return scriptedResponse{status: 500}
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
+		testReceiverDeviceID: savedEntry(airplay.PairingCodeNone, false),
+	})
+	run := runCLI(t, receiver, credFile, presetCode, "", "-device-id", testReceiverDeviceID)
+	if run.err == nil {
+		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	}
+	requireNoAuthorization(t, receiver.seen())
+}
+
+func rawEntryBeforeIdentities() *airplay.SavedCredentials {
+	entry := savedEntry(airplay.PairingCodeNone, false)
+	entry.PairingProtocol = airplay.PairingProtocolRaw
+	return entry
+}
+
+// A raw pairing saved before identities is paired with again raw: it took no
+// code, so none is offered, whatever /info now claims. The preset code went
+// into SRP pair-setup, and a Digest of it to a 401, when /info claimed a
+// legacy pairing password.
+func TestRawPairingBeforeIdentitiesIsPairedAgainOnlyRaw(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		features, status   uint64
+		wantNoPairingSetup bool
+	}{
+		{"device claims a legacy pairing password", legacyTestFeatures, statusPassword, true},
+		{"device claims an on-screen PIN", modernTestFeatures, 1 << 9, true},
+		{"device claims nothing but will not pair raw", modernTestFeatures, 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+				switch request.path {
+				case "/info":
+					return infoResponse(t, testReceiverDeviceID, test.features, test.status)
+				case "/pair-setup":
+					return scriptedResponse{status: 500}
+				default:
+					return digestChallenge()
+				}
+			})
+			credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{testReceiverDeviceID: rawEntryBeforeIdentities()})
+			run := runCLI(t, receiver, credFile, presetCode, "", "-device-id", testReceiverDeviceID)
+			if run.err == nil {
+				t.Fatalf("doubletake succeeded:\n%s", run.output)
+			}
+			if !strings.Contains(run.output, "remove its entry from the credentials file") {
+				t.Fatalf("the refusal does not say what to do:\n%s", run.output)
+			}
+			requests := receiver.seen()
+			requireNoAuthorization(t, requests)
+			if countPath(requests, "/pair-pin-start") != 0 {
+				t.Fatal("asked a receiver paired with raw for a PIN")
+			}
+			for _, request := range requests {
+				if request.path != "/pair-setup" {
+					continue
+				}
+				if test.wantNoPairingSetup {
+					t.Fatalf("pair-setup sent to a device asking for a code the receiver never took")
+				}
+				// Raw pair-setup is our 32-byte key and nothing else: no SRP,
+				// no transient TLV8.
+				if len(request.body) != 32 {
+					t.Fatalf("pair-setup body is %d bytes, not raw pair-setup", len(request.body))
+				}
+			}
+		})
+	}
+}
+
+// The real raw receiver is paired with again, raw, and the session goes on.
+// The old entry is kept as it was.
+func TestRawPairingBeforeIdentitiesPairsAgainRaw(t *testing.T) {
+	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
+		ListenAddress: "127.0.0.1:0",
+		Profile:       airplay.ReceiverProfileAppleTV3,
+		DeviceID:      testReceiverDeviceID,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Close()
+		<-served
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{testReceiverDeviceID: rawEntryBeforeIdentities()})
+	pastPairing := func() bool { return server.Stats().FairPlayRequests > 0 }
+	output := startCLIUntil(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "", pastPairing,
+		"-device-id", testReceiverDeviceID)
+	if !pastPairing() {
+		t.Fatalf("the raw receiver was not paired with again:\n%s", output)
+	}
+	if stats := server.Stats(); stats.PairSetup != 1 || stats.PINStarts != 0 {
+		t.Fatalf("pairing requests %+v, want one raw pair-setup", stats)
+	}
+	store, err := airplay.NewCredentialStore(credFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := store.Lookup(testReceiverDeviceID); !entry.UsesRawPairing() || entry.HasReceiverIdentity() {
+		t.Fatalf("the saved raw pairing changed: %+v", entry)
+	}
+}
+
+// A pairing saved before addresses were recorded is bound to the address
+// once the receiver proves its saved identity there, and only then.
+func TestProvenReceiverIsBoundToItsAddress(t *testing.T) {
+	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
+		ListenAddress: "127.0.0.1:0",
+		Profile:       airplay.ReceiverProfileModern,
+		Auth:          airplay.ReceiverAuthPIN,
+		Code:          "4827",
+		DeviceID:      testReceiverDeviceID,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Close()
+		<-served
+	})
+	port := server.Addr().(*net.TCPAddr).Port
+	credFile := filepath.Join(t.TempDir(), "credentials.json")
+	load := func() *airplay.CredentialStore {
+		store, err := airplay.NewCredentialStore(credFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	paired := func() bool { return load().Lookup(testReceiverDeviceID).HasReceiverIdentity() }
+	startCLIUntil(t, port, credFile, "", "4827\n", paired)
+	if !paired() {
+		t.Fatal("first run did not pair")
+	}
+
+	// As saved before receiver_address existed, with a stale entry holding
+	// the address.
+	var entries map[string]*airplay.SavedCredentials
+	data, err := os.ReadFile(credFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	entries[testReceiverDeviceID].ReceiverAddress = ""
+	entries[testReceiverDeviceID].PairedAt = ""
+	stale := boundEntry()
+	stale.ReceiverAddress = "192.0.2.1"
+	entries[boundDeviceID] = stale
+	data, err = json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	before := server.Stats()
+	bound := func() bool { return load().Lookup(testReceiverDeviceID).ReceiverAddress == "127.0.0.1" }
+	output := startCLIUntil(t, port, credFile, "", "", bound, "-device-id", testReceiverDeviceID)
+	if !bound() {
+		t.Fatalf("a receiver that proved itself by address was not bound to it:\n%s", output)
+	}
+	if server.Stats().PairSetup != before.PairSetup {
+		t.Fatal("the second run paired again instead of verifying")
+	}
+	if got := load().Lookup(testReceiverDeviceID).PairedAt; got != "" {
+		t.Fatalf("binding changed paired_at to %q", got)
+	}
+}
+
+// Nothing is bound after a pair-verify that did not prove the receiver.
+func TestUnprovenReceiverIsNotBoundToItsAddress(t *testing.T) {
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		switch request.path {
+		case "/info":
+			return infoResponse(t, testReceiverDeviceID, modernTestFeatures, 0)
+		case "/pair-verify":
+			return pairVerifyRefused()
+		default:
+			return scriptedResponse{status: 500}
+		}
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
+		testReceiverDeviceID: savedEntry(airplay.PairingCodePIN, true),
+	})
+	run := runCLI(t, receiver, credFile, "", "1234\n", "-device-id", testReceiverDeviceID)
+	if run.err == nil {
+		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	}
+	store, err := airplay.NewCredentialStore(credFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Lookup(testReceiverDeviceID).ReceiverAddress; got != "" {
+		t.Fatalf("an unproven device's address %q was bound to the receiver", got)
+	}
+}
+
+// A raw pairing proves nothing, so a raw receiver paired with again does not
+// get the preset code for its Digest: only a receiver that has proven itself
+// does.
+func TestRawRepairDoesNotReleaseThePresetCode(t *testing.T) {
+	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
+		ListenAddress: "127.0.0.1:0",
+		Profile:       airplay.ReceiverProfileAppleTV3,
+		Auth:          airplay.ReceiverAuthDigest,
+		Code:          presetCode,
+		// Its /info claims no code; it challenges after pairing.
+		HidePasswordStatus: true,
+		DeviceID:           testReceiverDeviceID,
+		Logger:             log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Close()
+		<-served
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{testReceiverDeviceID: rawEntryBeforeIdentities()})
+	run := runScriptlessCLI(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "-device-id", testReceiverDeviceID)
+	if run.err == nil {
+		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	}
+	stats := server.Stats()
+	if stats.PairSetup != 1 || stats.DigestChallenges == 0 || !strings.Contains(run.output, "requires a code or password") {
+		t.Fatalf("the run did not pair raw and then stop at the Digest challenge (%+v):\n%s", stats, run.output)
+	}
+}
+
+// runScriptlessCLI runs doubletake to completion against a receiver at port.
+func runScriptlessCLI(t *testing.T, port int, credFile, code string, args ...string) cliRun {
+	t.Helper()
+	all := append([]string{"-target", "127.0.0.1", "-port", strconv.Itoa(port), "-creds", credFile, "-no-audio", "-test"}, args...)
+	encoded, err := json.Marshal(all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0])
+	env := []string{cliArgsEnv + "=" + string(encoded)}
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "DOUBLETAKE_") {
+			env = append(env, kv)
+		}
+	}
+	if code != "" {
+		env = append(env, "DOUBLETAKE_CODE="+code)
+	}
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("doubletake did not finish: %s", output)
+	}
+	return cliRun{output: string(output), err: err}
 }
