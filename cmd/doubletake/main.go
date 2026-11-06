@@ -80,6 +80,7 @@ func main() {
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Unix socket path for daemon control interface")
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
+	audioSource := flag.String("audio-source", "", "PulseAudio/PipeWire source to capture audio from (e.g. a null sink monitor); empty = default output monitor")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
@@ -657,7 +658,7 @@ func main() {
 
 	// Start audio capture and streaming unless disabled.
 	if !*noAudio && session.HasAudio() {
-		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
+		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec(), airplay.AudioCaptureOptions{Source: *audioSource})
 		if err != nil {
 			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
 		} else {

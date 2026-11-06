@@ -108,7 +108,7 @@ func TestAudioCaptureTestToneCarriesSourcePTSWithoutHardware(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	capture, err := StartAudioCapture(ctx, true, AudioCodecALAC)
+	capture, err := StartAudioCapture(ctx, true, AudioCodecALAC, AudioCaptureOptions{})
 	if err != nil {
 		t.Fatalf("start timestamped test-tone capture: %v", err)
 	}
@@ -449,4 +449,33 @@ func testNTPFromTime(value time.Time) uint64 {
 	seconds := uint64(value.Unix() + secondsFrom1900To1970)
 	fraction := (uint64(value.Nanosecond()) << 32) / uint64(time.Second)
 	return seconds<<32 | fraction
+}
+
+func TestAnExplicitAudioSourceIsCapturedInsteadOfTheDefaultMonitor(t *testing.T) {
+	args, source, err := selectCaptureSource(AudioCaptureOptions{Source: "castr_cast_1.monitor"}, true, true, func() string {
+		t.Fatal("monitor detection must not run when a source is named")
+		return ""
+	}, AudioCodecALAC)
+	if err != nil || source != "pulse" {
+		t.Fatalf("source=%q err=%v", source, err)
+	}
+	joined := strings.Join(args, " ")
+	want := strings.Join(pulseMonitorSourceArgs("castr_cast_1.monitor", AudioCodecALAC), " ")
+	if joined != want || !strings.Contains(joined, "device=castr_cast_1.monitor") {
+		t.Fatalf("args = %q, want %q", joined, want)
+	}
+}
+
+func TestAnExplicitAudioSourceNeverFallsBackToPipeWire(t *testing.T) {
+	_, _, err := selectCaptureSource(AudioCaptureOptions{Source: "castr_cast_1.monitor"}, false, true, func() string { return "x" }, AudioCodecALAC)
+	if err == nil || !strings.Contains(err.Error(), "pulsesrc") {
+		t.Fatalf("err = %v, want a clear pulsesrc error", err)
+	}
+}
+
+func TestNoExplicitAudioSourceKeepsTheDefaultMonitor(t *testing.T) {
+	args, source, err := selectCaptureSource(AudioCaptureOptions{}, true, true, func() string { return "def.monitor" }, AudioCodecALAC)
+	if err != nil || source != "pulse" || !strings.Contains(strings.Join(args, " "), "device=def.monitor") {
+		t.Fatalf("args=%v source=%q err=%v", args, source, err)
+	}
 }

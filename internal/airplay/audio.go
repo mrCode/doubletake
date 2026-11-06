@@ -188,6 +188,32 @@ func selectAudioMonitorSource(hasPulse bool, monitor string, hasPipeWire bool, c
 	return nil, ""
 }
 
+// AudioCaptureOptions tunes where StartAudioCapture reads from.
+type AudioCaptureOptions struct {
+	// Source is a PulseAudio/PipeWire source name (for example a null sink's
+	// ".monitor"). Empty means capture the default output's monitor.
+	Source string
+}
+
+// selectCaptureSource chooses the capture source arguments. A named source is
+// always read through pulsesrc and never falls back to pipewiresrc, since the
+// caller asked for that specific source. detectMonitor is only called for the
+// default-monitor case.
+func selectCaptureSource(opts AudioCaptureOptions, hasPulse, hasPipeWire bool, detectMonitor func() string, codec AudioCodec) ([]string, string, error) {
+	if opts.Source != "" {
+		if !hasPulse {
+			return nil, "", fmt.Errorf("audio source %q requested but the GStreamer pulsesrc element is not available", opts.Source)
+		}
+		return pulseMonitorSourceArgs(opts.Source, codec), "pulse", nil
+	}
+	monitor := ""
+	if hasPulse {
+		monitor = detectMonitor()
+	}
+	args, source := selectAudioMonitorSource(hasPulse, monitor, hasPipeWire, codec)
+	return args, source, nil
+}
+
 func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bool) []string {
 	_, codecSPF, _, _, _, _ := codec.Info()
 	format := "S16LE"
@@ -243,7 +269,7 @@ func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bo
 // StartAudioCapture launches a pipeline that captures system audio (monitor source)
 // and feeds raw PCM into the encoder negotiated by SETUP. ALAC is built in;
 // AAC-ELD is available in builds made with -tags fdk_aac and libfdk-aac.
-func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*AudioCapture, error) {
+func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec, opts AudioCaptureOptions) (*AudioCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 	if codec != AudioCodecALAC && codec != AudioCodecAACELD {
 		cancel()
@@ -260,12 +286,17 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 	} else {
 		hasPipeWireSource := exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil
 		hasPulseSource := exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil
-		monitor := ""
-		if hasPulseSource {
-			monitor = detectPulseMonitor()
-		}
+		monitor := opts.Source
 		var source string
-		srcArgs, source = selectAudioMonitorSource(hasPulseSource, monitor, hasPipeWireSource, codec)
+		var selErr error
+		srcArgs, source, selErr = selectCaptureSource(opts, hasPulseSource, hasPipeWireSource, func() string {
+			monitor = detectPulseMonitor()
+			return monitor
+		}, codec)
+		if selErr != nil {
+			cancel()
+			return nil, selErr
+		}
 		switch source {
 		case "pulse":
 			fragmentTime := audioCaptureFragmentTime(codec)
