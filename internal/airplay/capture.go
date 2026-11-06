@@ -865,6 +865,13 @@ func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, alwaysCopy bool) g
 		fmt.Sprintf("path=%d", nodeID),
 		"do-timestamp=true",
 		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
+		// The pipeline runs on the system clock, not on one derived from the
+		// PipeWire stream. The portal pauses and renegotiates the stream at
+		// will, and the stream's clock stops or steps back while it does. A
+		// live compositor waiting on that clock then never wakes, the source
+		// thread blocks behind it holding the portal's buffers, and the portal
+		// -- out of buffers -- renegotiates again: the picture freezes for good.
+		"provide-clock=false",
 	}
 	if alwaysCopy {
 		// Retaining elements downstream must never hold every buffer in the

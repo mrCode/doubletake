@@ -419,6 +419,7 @@ func TestPipeWireVideoSourceBufferPoolPolicy(t *testing.T) {
 		"path=42",
 		"do-timestamp=true",
 		"keepalive-time=34",
+		"provide-clock=false",
 	}
 	for _, test := range []struct {
 		name       string
@@ -970,7 +971,7 @@ func TestSystemWaylandPipelineDetachesBeforeRetention(t *testing.T) {
 		}
 	}
 	wantOrder := []string{
-		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34",
+		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34", "provide-clock=false",
 		"!", "video/x-raw(ANY),pixel-aspect-ratio=1/1",
 		"!", "videoconvert", "!", "video/x-raw,format=NV12",
 		"!", "videoscale", "add-borders=true", "!", "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1",
@@ -995,7 +996,7 @@ func TestVAPostprocPlainRawWaylandPipelineScalesBeforeRetention(t *testing.T) {
 		}
 	}
 	wantOrder := []string{
-		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34",
+		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34", "provide-clock=false",
 		"!", "video/x-raw(ANY),pixel-aspect-ratio=1/1",
 		"!", "vapostproc", "disable-passthrough=true", "add-borders=true",
 		"!", "video/x-raw,format=P010_10LE,width=1920,height=1080,pixel-aspect-ratio=1/1",
