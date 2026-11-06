@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestCredentialStoreSaveRestoreTokenPreservesPairingCredentials(t *testing.T) {
@@ -97,7 +100,7 @@ func TestCredentialStorePersistsNegotiatedPairingProtocol(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	receiver := &ReceiverIdentity{PublicKey: receiverPub}
-	if err := store.SavePairing("raw-device", "pair-id", pub, priv, PairingProtocolRaw, receiver); err != nil {
+	if err := store.SavePairing("raw-device", "pair-id", pub, priv, PairingProtocolRaw, receiver, PairingOrigin{}); err != nil {
 		t.Fatalf("SavePairing: %v", err)
 	}
 	if err := store.SaveRestoreToken("raw-device", "restore-token"); err != nil {
@@ -209,5 +212,92 @@ func TestRestorePairingCredentialsRejectsUnknownProtocol(t *testing.T) {
 	}
 	if client.PairKeys != nil || client.PairingProtocol() != PairingProtocolUnknown {
 		t.Fatal("failed restore partially mutated the client")
+	}
+}
+
+// How a receiver is paired with again follows the kind of code its pairing
+// was made with, so that kind is saved with the pairing, under the field names
+// castr copies between its credential files.
+func TestSavePairingRecordsTheCodeKindAndWhen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store, err := NewCredentialStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hap := &ReceiverIdentity{ID: "receiver-id", PublicKey: receiverPub}
+
+	readRaw := func(deviceID string) map[string]any {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var file map[string]map[string]any
+		if err := json.Unmarshal(data, &file); err != nil {
+			t.Fatal(err)
+		}
+		return file[deviceID]
+	}
+	checkPairedAt := func(entry map[string]any, before time.Time) {
+		t.Helper()
+		value, _ := entry["paired_at"].(string)
+		at, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			t.Fatalf("paired_at = %q: %v", value, err)
+		}
+		if _, offset := at.Zone(); offset != 0 || !strings.HasSuffix(value, "Z") {
+			t.Fatalf("paired_at = %q, want UTC", value)
+		}
+		if at.Before(before.Add(-time.Second)) || at.After(time.Now().Add(time.Second)) {
+			t.Fatalf("paired_at = %v, want about now", at)
+		}
+	}
+
+	before := time.Now()
+	if err := store.SavePairing("pin-device", "pair-id", pub, priv, PairingProtocolHAP, hap,
+		PairingOrigin{Code: PairingCodePIN}); err != nil {
+		t.Fatal(err)
+	}
+	entry := readRaw("pin-device")
+	if entry["pairing_code"] != "pin" {
+		t.Fatalf("pairing_code = %#v, want \"pin\"", entry["pairing_code"])
+	}
+	checkPairedAt(entry, before)
+
+	// Pairing again replaces both: the kind and time of an earlier pairing say
+	// nothing about this one.
+	if err := store.SavePairing("pin-device", "pair-id", pub, priv, PairingProtocolHAP, hap,
+		PairingOrigin{Code: PairingCodePassword}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Lookup("pin-device"); got.PairingCode != PairingCodePassword {
+		t.Fatalf("after pairing with a password, pairing_code = %q", got.PairingCode)
+	}
+
+	// Raw pair-setup takes no code, whatever the caller claims.
+	if err := store.SavePairing("raw-device", "pair-id", pub, priv, PairingProtocolRaw,
+		&ReceiverIdentity{PublicKey: receiverPub}, PairingOrigin{Code: PairingCodePIN}); err != nil {
+		t.Fatal(err)
+	}
+	entry = readRaw("raw-device")
+	if _, ok := entry["pairing_code"]; ok {
+		t.Fatalf("raw pairing saved pairing_code %#v", entry["pairing_code"])
+	}
+	checkPairedAt(entry, before)
+
+	if err := store.SavePairing("odd-device", "pair-id", pub, priv, PairingProtocolHAP, hap,
+		PairingOrigin{Code: "sticky-note"}); err == nil {
+		t.Fatal("saved a pairing made with an unknown kind of code")
+	}
+	if store.Lookup("odd-device") != nil {
+		t.Fatal("an unknown kind of code was written")
 	}
 }

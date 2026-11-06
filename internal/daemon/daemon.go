@@ -679,6 +679,14 @@ func requiredPairingCredentialKind(info *airplay.ReceiverInfo) CredentialKind {
 	}
 }
 
+// pairingCodeFor is the kind of code a pairing made with kind records.
+func pairingCodeFor(kind CredentialKind) airplay.PairingCode {
+	if kind == CredentialKindPassword {
+		return airplay.PairingCodePassword
+	}
+	return airplay.PairingCodePIN
+}
+
 func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCredentials) error {
 	return client.RestorePairingCredentials(saved)
 }
@@ -884,6 +892,31 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	if suppliedCredential != "" {
 		credential = suppliedCredential
 	}
+	if expectedDeviceID == "" {
+		// What discovery advertised for this address, before this connection.
+		d.mu.Lock()
+		for _, device := range d.devices {
+			if device.IP == target {
+				expectedDeviceID = device.DeviceID
+				break
+			}
+		}
+		d.mu.Unlock()
+	}
+	// A receiver this machine holds a proven identity for must prove it again
+	// before the credential goes anywhere: the client answers any 401 with an
+	// MD5 Digest of it, crackable offline when the code is short, and a device
+	// at the address can challenge before pair-verify. So the password is
+	// installed only once the receiver has proven itself.
+	holdPassword := false
+	if expectedDeviceID != "" {
+		expected, err := d.credStore.LookupReceiver(expectedDeviceID, expectedDeviceID)
+		if err != nil {
+			removeStream(fmt.Sprintf("%v; refusing to cast", err))
+			return
+		}
+		holdPassword = expected.HasReceiverIdentity()
+	}
 	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
 		var next *airplay.AirPlayClient
 		d.mu.Lock()
@@ -898,7 +931,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		if next == nil {
 			next = airplay.NewAirPlayClient(target, port)
 		}
-		next.SetPassword(credential)
+		if !holdPassword {
+			next.SetPassword(credential)
+		}
 		if err := next.Connect(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -938,17 +973,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	deviceID := info.DeviceID
 	if expectedDeviceID == "" {
-		// What discovery advertised for this address, before this connection.
-		d.mu.Lock()
-		for _, device := range d.devices {
-			if device.IP == target {
-				expectedDeviceID = device.DeviceID
-				break
-			}
-		}
-		d.mu.Unlock()
-	}
-	if expectedDeviceID == "" {
 		log.Printf("[daemon] warning: no device_id for %s and none discovered; a device there naming itself as a new receiver would be paired with from scratch", target)
 	}
 	savedCreds, err := d.credStore.LookupReceiver(expectedDeviceID, deviceID)
@@ -959,6 +983,12 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	screenCastRestoreToken := ""
 	if savedCreds != nil {
 		screenCastRestoreToken = savedCreds.RestoreToken
+	}
+	if savedCreds.HasReceiverIdentity() && !holdPassword {
+		// Found only by the ID the device reported; it still proves itself
+		// before the password is used again.
+		holdPassword = true
+		client.SetPassword("")
 	}
 
 	reconnect := func() error {
@@ -985,53 +1015,35 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// transient pairing proves nothing and leaves nothing to verify against;
 	// saving it would produce credentials that cannot tell this receiver from
 	// an impersonator.
-	savePairing := func() {
+	savePairing := func(kind airplay.PairingCode) {
 		if receiver := client.ReceiverIdentity(); client.PairKeys != nil && receiver != nil {
 			if err := d.credStore.SavePairing(deviceID, client.PairingID,
 				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
-				client.PairingProtocol(), receiver); err != nil {
+				client.PairingProtocol(), receiver, airplay.PairingOrigin{Code: kind}); err != nil {
 				log.Printf("[daemon] warning: failed to save credentials: %v", err)
 			} else {
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
 			}
 		}
 	}
-	pairWithCredentialValue := func(value string) error {
+	pairWithCredentialValue := func(value string, kind CredentialKind) error {
 		credential = value
 		if err := client.Pair(ctx, value); err != nil {
 			return err
 		}
-		savePairing()
+		savePairing(pairingCodeFor(kind))
 		return nil
 	}
 
-	waitForCredential := func(kind CredentialKind) (string, error) {
+	// awaitCredential waits for the user's credential of the given kind; a
+	// PIN must already be showing on the receiver.
+	awaitCredential := func(kind CredentialKind) (string, error) {
 		d.mu.Lock()
 		if d.streams[target] != entry {
 			d.mu.Unlock()
 			return "", context.Canceled
 		}
 		entry.credentialKind = kind
-		d.mu.Unlock()
-
-		// Do not expose the PIN prompt until the receiver has accepted the request
-		// to display one. Password mode deliberately never touches this endpoint.
-		if kind == CredentialKindPIN {
-			if err := client.StartPINDisplay(); err != nil {
-				d.mu.Lock()
-				if d.streams[target] == entry {
-					entry.credentialKind = ""
-				}
-				d.mu.Unlock()
-				return "", fmt.Errorf("start PIN display: %w", err)
-			}
-		}
-
-		d.mu.Lock()
-		if d.streams[target] != entry {
-			d.mu.Unlock()
-			return "", context.Canceled
-		}
 		entry.state = StatePINRequired
 		d.mu.Unlock()
 
@@ -1047,6 +1059,16 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			d.mu.Unlock()
 			return "", ctx.Err()
 		}
+	}
+	waitForCredential := func(kind CredentialKind) (string, error) {
+		// Do not expose the PIN prompt until the receiver has accepted the request
+		// to display one. Password mode deliberately never touches this endpoint.
+		if kind == CredentialKindPIN {
+			if err := client.StartPINDisplay(); err != nil {
+				return "", fmt.Errorf("start PIN display: %w", err)
+			}
+		}
+		return awaitCredential(kind)
 	}
 
 	// Pairing
@@ -1105,7 +1127,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 				credential = value
 				client.SetPassword(credential)
 			}
-			if err := pairWithCredentialValue(credential); err != nil {
+			if err := pairWithCredentialValue(credential, kind); err != nil {
 				return fmt.Errorf("%s pairing: %w", kind, err)
 			}
 			return nil
@@ -1116,32 +1138,31 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		// keep it solely for Digest and still perform transient HAP pairing, even
 		// when the receiver also publishes the on-screen PIN bit.
 		// pairAgainWithCode pairs again with a receiver this machine has paired
-		// with before. It goes through PairWithCode, which never falls back to
-		// transient pairing whatever /info claims: only the real receiver can
-		// show its PIN on its own screen.
+		// with before, with the kind of code its saved pairing was made with;
+		// airplay.PairAgainWithCode says why /info is not asked. The daemon has
+		// no way to ask for pairing again explicitly, so a pairing made with a
+		// pairing password is never made again here.
 		pairAgainWithCode := func() error {
-			kind, code := CredentialKindPIN, ""
-			if requiredPairingCredentialKind(info) == CredentialKindPassword {
-				// A legacy receiver's configured pairing password.
-				kind, code = CredentialKindPassword, credential
+			kind, err := client.PairAgainWithCode(ctx, savedCreds, false, "", airplay.CodePrompts{
+				PIN: func() (string, error) {
+					// A PIN is shown afresh each time, so a preset value cannot
+					// be it: wait for the one shown.
+					value, err := awaitCredential(CredentialKindPIN)
+					if err != nil {
+						return "", fmt.Errorf("wait for %s: %w", CredentialKindPIN, err)
+					}
+					return value, nil
+				},
+			})
+			if errors.Is(err, airplay.ErrPasswordPairingNotRepeated) {
+				return fmt.Errorf("%v; refusing to pair with %s again automatically. If it is the "+
+					"receiver you paired with, remove its saved pairing and connect again to pair "+
+					"with its password.", err, info.Name)
 			}
-			// A PIN is shown afresh each time, so a preset value cannot be it:
-			// show one and wait for it.
-			if code == "" {
-				value, err := waitForCredential(kind)
-				if err != nil {
-					return fmt.Errorf("wait for %s: %w", kind, err)
-				}
-				code = value
+			if err != nil {
+				return fmt.Errorf("pairing again: %w", err)
 			}
-			if kind == CredentialKindPassword {
-				credential = code
-				client.SetPassword(code)
-			}
-			if err := client.PairWithCode(ctx, code); err != nil {
-				return fmt.Errorf("%s pairing: %w", kind, err)
-			}
-			savePairing()
+			savePairing(kind)
 			return nil
 		}
 		if mustPairWithCode {
@@ -1186,6 +1207,11 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			}
 		}
 	}
+
+	// The receiver has proven itself -- by pair-verify against its saved
+	// identity, or by pairing with a code -- or none was held for it.
+	holdPassword = false
+	client.SetPassword(credential)
 
 	// A configured playback password is independent from pair-verify. A saved or
 	// transient pairing may succeed without it, but SETUP will later issue a

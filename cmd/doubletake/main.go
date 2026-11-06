@@ -166,6 +166,7 @@ func main() {
 		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
 	}
 
+	var client *airplay.AirPlayClient
 	newClient := func() *airplay.AirPlayClient {
 		if advertisement != nil {
 			device := *advertisement
@@ -175,8 +176,38 @@ func main() {
 		}
 		return airplay.NewAirPlayClient(addr, *port)
 	}
-	client := newClient()
-	client.SetPassword(credential)
+
+	credStore, err := newCredentialStore(*credBackend, *credFile)
+	if err != nil {
+		log.Fatalf("failed to load credentials: %v", err)
+	}
+	// The receiver meant: as given, or as discovery advertised it when it was
+	// picked. Without either, the device at -target is taken at its word.
+	expectedID := *expectedDeviceID
+	if expectedID == "" && advertisement != nil {
+		expectedID = advertisement.DeviceID
+	}
+	// A receiver this machine holds a proven identity for must prove it again
+	// before the code goes anywhere: the client answers any 401 with an MD5
+	// Digest of it, crackable offline when the code is short, and a device
+	// at the address can challenge before pair-verify. So the password is
+	// installed only once the receiver has proven itself.
+	holdPassword := false
+	if expectedID != "" {
+		expected, err := credStore.LookupReceiver(expectedID, expectedID)
+		if err != nil {
+			log.Fatalf("%v; refusing to cast", err)
+		}
+		holdPassword = expected.HasReceiverIdentity()
+	}
+	installPassword := func() {
+		if !holdPassword {
+			client.SetPassword(credential)
+		}
+	}
+
+	client = newClient()
+	installPassword()
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
 	}
@@ -192,7 +223,7 @@ func main() {
 		if credential == "" {
 			log.Fatal("password cannot be empty")
 		}
-		client.SetPassword(credential)
+		installPassword()
 	}
 
 	// Pairing flow:
@@ -208,19 +239,8 @@ func main() {
 	// pairing PIN is what is actually wanted, -pair asks for one.
 	needFullPair := *forcePair
 
-	credStore, err := newCredentialStore(*credBackend, *credFile)
-	if err != nil {
-		log.Fatalf("failed to load credentials: %v", err)
-	}
-
 	// Looked up even for -pair: a receiver this machine has paired with is
 	// paired with again only with a code, never transiently.
-	// The receiver meant: as given, or as discovery advertised it when it was
-	// picked. Without either, the device at -target is taken at its word.
-	expectedID := *expectedDeviceID
-	if expectedID == "" && advertisement != nil {
-		expectedID = advertisement.DeviceID
-	}
 	if expectedID == "" {
 		log.Printf("warning: no -device-id; a device at %s naming itself as a new receiver would be paired with from scratch", addr)
 	}
@@ -229,11 +249,17 @@ func main() {
 		log.Fatalf("%v; refusing to cast", err)
 	}
 	pairedWithCode := savedCreds.HasPairingCredentials() && !savedCreds.UsesRawPairing()
+	if savedCreds.HasReceiverIdentity() && !holdPassword {
+		// Found only by the ID the device reported; it still proves itself
+		// before the password is used again.
+		holdPassword = true
+		client.SetPassword("")
+	}
 
 	reconnect := func() {
 		_ = client.Close()
 		client = newClient()
-		client.SetPassword(credential)
+		installPassword()
 		if err := client.Connect(ctx); err != nil {
 			log.Fatalf("reconnect failed: %v", err)
 		}
@@ -251,8 +277,8 @@ func main() {
 		}
 	}
 
-	var pairWithCredential func(value string, expectPIN bool)
-	savePairingCredentials := func() {
+	var pairWithCredential func(value string, expectPIN bool, kind airplay.PairingCode)
+	savePairingCredentials := func(kind airplay.PairingCode) {
 		// Only a pairing that proved the receiver's identity is worth saving:
 		// without that identity a later pair-verify has nothing to check the
 		// receiver against.
@@ -262,7 +288,7 @@ func main() {
 		}
 		if err := credStore.SavePairing(info.DeviceID, client.PairingID,
 			client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
-			client.PairingProtocol(), receiver); err != nil {
+			client.PairingProtocol(), receiver, airplay.PairingOrigin{Code: kind}); err != nil {
 			log.Printf("warning: failed to save credentials: %v", err)
 		} else {
 			log.Printf("credentials saved (%s)", *credBackend)
@@ -270,21 +296,35 @@ func main() {
 	}
 	pairFresh := func() {
 		if passwordRequiresPairing(info) {
-			pairWithCredential("", false)
+			pairWithCredential("", false, airplay.PairingCodePassword)
 		} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
-			pairWithCredential("", true)
+			pairWithCredential("", true, airplay.PairingCodePIN)
 		} else if err := client.Pair(ctx, ""); err != nil {
 			if info.RequiresPassword() {
 				log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
 			}
 			log.Printf("transient pairing failed: %v, requesting pairing credentials", err)
 			reconnect()
-			pairWithCredential("", false)
+			// Nothing advertised which code this receiver takes; the prompt
+			// decides, by whether it showed a PIN.
+			pairWithCredential("", false, airplay.PairingCodeNone)
 		}
 	}
-	pairWithCredential = func(value string, expectPIN bool) {
+	// pairWithCredential pairs with a code of the given kind; with no kind,
+	// it is a PIN if the receiver accepted the request to show one.
+	pairWithCredential = func(value string, expectPIN bool, kind airplay.PairingCode) {
 		if value == "" {
-			value = credentialOrPrompt(credential, client, expectPIN)
+			var pinShown bool
+			value, pinShown = credentialOrPrompt(credential, client, expectPIN)
+			if kind == airplay.PairingCodeNone {
+				kind = airplay.PairingCodePassword
+				if pinShown {
+					kind = airplay.PairingCodePIN
+				}
+			}
+		}
+		if kind == airplay.PairingCodeNone {
+			kind = airplay.PairingCodePassword
 		}
 		// AirPlay uses the same user-entered value for pair-setup and, on
 		// password-protected receivers, the later HTTP Digest challenge.
@@ -293,34 +333,43 @@ func main() {
 		if err := client.Pair(ctx, value); err != nil {
 			log.Fatalf("pairing failed: %v", err)
 		}
-		savePairingCredentials()
+		savePairingCredentials(kind)
 	}
 	// pairAgainWithCode pairs again with a receiver this machine has paired
-	// with before. It goes through PairWithCode, which never falls back to
-	// transient pairing whatever /info claims: only the real receiver can show
-	// its PIN on its own screen.
-	pairAgainWithCode := func() {
-		var code string
-		if passwordRequiresPairing(info) {
-			// A legacy receiver's configured pairing password.
-			code = credential
-			if code == "" {
-				code = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's pairing password: ")
-			}
-			credential = code
-			client.SetPassword(code)
-		} else {
-			// A PIN is shown afresh each time, so a preset -code cannot be it:
-			// show one and ask for it.
-			code = credentialOrPrompt("", client, true)
+	// with before, with the kind of code its saved pairing was made with;
+	// airplay.PairAgainWithCode says why /info is not asked.
+	pairAgainWithCode := func(explicit bool) {
+		reader := bufio.NewReader(os.Stdin)
+		kind, err := client.PairAgainWithCode(ctx, savedCreds, explicit, credential, airplay.CodePrompts{
+			PIN: func() (string, error) {
+				// A PIN is shown afresh each time, so a preset -code cannot be it.
+				code := readCredential(reader, pairingCredentialPrompt(true, nil))
+				if code == "" {
+					return "", errors.New("the PIN cannot be empty")
+				}
+				return code, nil
+			},
+			Password: func() (string, error) {
+				code := readCredential(reader, "Enter the receiver's pairing password: ")
+				if code == "" {
+					return "", errors.New("the pairing password cannot be empty")
+				}
+				// Also the receiver's Digest password; keep it for reconnects.
+				credential = code
+				return code, nil
+			},
+		})
+		if errors.Is(err, airplay.ErrPasswordPairingNotRepeated) {
+			log.Fatalf("%v; refusing to pair with %q again automatically. If it is the receiver you "+
+				"paired with, run again with -pair to pair with it again.", err, info.Name)
 		}
-		if err := client.PairWithCode(ctx, code); err != nil {
+		if err != nil {
 			log.Fatalf("pairing failed: %v", err)
 		}
-		savePairingCredentials()
+		savePairingCredentials(kind)
 	}
 	if needFullPair && pairedWithCode {
-		pairAgainWithCode()
+		pairAgainWithCode(true)
 	} else if needFullPair {
 		if forcePairUsesTransient(info) {
 			// A modern receiver's fixed playback password belongs only to HTTP
@@ -332,7 +381,11 @@ func main() {
 			}
 		} else {
 			// Full pair-setup with a supplied PIN/password, or request an onscreen PIN.
-			pairWithCredential(credential, !info.RequiresPassword())
+			kind := airplay.PairingCodePassword
+			if !info.RequiresPassword() {
+				kind = airplay.PairingCodePIN
+			}
+			pairWithCredential(credential, !info.RequiresPassword(), kind)
 		}
 	} else if savedCreds.HasPairingCredentials() {
 		// Once this machine has paired with a receiver, nothing falls back to
@@ -367,12 +420,16 @@ func main() {
 			if step == airplay.SavedPairingPairAsNew {
 				pairFresh()
 			} else {
-				pairAgainWithCode()
+				pairAgainWithCode(false)
 			}
 		}
 	} else {
 		pairFresh()
 	}
+	// The receiver has proven itself -- by pair-verify against its saved
+	// identity, or by pairing with a code -- or none was held for it.
+	holdPassword = false
+	installPassword()
 	log.Println("pairing complete")
 
 	// FairPlay setup — establishes fp-setup state and ekey/eiv used for the
@@ -580,9 +637,11 @@ func main() {
 // an on-screen PIN (or the user explicitly requested fresh pairing). A successful
 // /pair-pin-start response alone cannot distinguish a PIN from a fixed password,
 // so an unadvertised fallback keeps its prompt deliberately generic.
-func credentialOrPrompt(value string, client *airplay.AirPlayClient, expectPIN bool) string {
+//
+// pinShown reports whether a PIN display was requested and accepted.
+func credentialOrPrompt(value string, client *airplay.AirPlayClient, expectPIN bool) (credential string, pinShown bool) {
 	if value != "" {
-		return value
+		return value, false
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -590,11 +649,11 @@ func credentialOrPrompt(value string, client *airplay.AirPlayClient, expectPIN b
 	if displayErr != nil {
 		log.Printf("warning: failed to trigger PIN display: %v", displayErr)
 	}
-	credential := readCredential(reader, pairingCredentialPrompt(expectPIN, displayErr))
+	credential = readCredential(reader, pairingCredentialPrompt(expectPIN, displayErr))
 	if credential == "" {
 		log.Fatal("pairing credential cannot be empty")
 	}
-	return credential
+	return credential, displayErr == nil
 }
 
 func pairingCredentialPrompt(expectPIN bool, displayErr error) string {

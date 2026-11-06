@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // SavedCredentials holds the persistent pairing credentials and optional
@@ -25,7 +26,32 @@ type SavedCredentials struct {
 	// not used to verify -- the receiver is paired with again instead.
 	ReceiverID        string `json:"receiver_id,omitempty"`
 	ReceiverPublicKey []byte `json:"receiver_ed25519_public,omitempty"`
-	RestoreToken      string `json:"restore_token,omitempty"`
+	// PairedAt is when the pairing was made, in RFC 3339 UTC.
+	PairedAt string `json:"paired_at,omitempty"`
+	// PairingCode is the kind of code the pairing was made with. Pairing again
+	// follows it rather than /info, which whatever answers at the address
+	// writes: an impersonator claiming a pairing password would otherwise be
+	// handed the preset code, or a Digest of it, without showing any PIN.
+	// Raw pairings, made with no code, leave it empty.
+	PairingCode  PairingCode `json:"pairing_code,omitempty"`
+	RestoreToken string      `json:"restore_token,omitempty"`
+}
+
+// PairingCode is the kind of code a pairing was made with.
+type PairingCode string
+
+const (
+	PairingCodeNone PairingCode = ""
+	// PairingCodePIN is a code shown afresh on the receiver's screen.
+	PairingCodePIN PairingCode = "pin"
+	// PairingCodePassword is a pairing password configured on the receiver.
+	PairingCodePassword PairingCode = "password"
+)
+
+// PairingOrigin is how a pairing being saved was made.
+type PairingOrigin struct {
+	// Code is the kind of code pair-setup was given.
+	Code PairingCode
 }
 
 // PairingProtocol is the pair-verify wire protocol negotiated when credentials
@@ -239,21 +265,33 @@ func (cs *CredentialStore) Save(deviceID string, pairingID string, pub ed25519.P
 // A pairing is refused without the receiver's identity: saving one would
 // produce credentials that cannot authenticate the receiver they were made
 // with, which is the weakness this field exists to close.
-func (cs *CredentialStore) SavePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol, receiver *ReceiverIdentity) error {
+//
+// origin records the kind of code used, which decides how the receiver is
+// paired with again; see SavedCredentials.PairingCode.
+func (cs *CredentialStore) SavePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol, receiver *ReceiverIdentity, origin PairingOrigin) error {
 	if protocol != PairingProtocolHAP && protocol != PairingProtocolRaw {
 		return fmt.Errorf("cannot save unknown pairing protocol %q", protocol)
 	}
 	if !receiver.valid() || (protocol == PairingProtocolHAP && receiver.ID == "") {
 		return fmt.Errorf("cannot save a pairing without the receiver's proven identity")
 	}
-	return cs.savePairingWith(deviceID, pairingID, pub, priv, protocol, receiver)
+	switch origin.Code {
+	case PairingCodeNone, PairingCodePIN, PairingCodePassword:
+	default:
+		return fmt.Errorf("cannot save unknown pairing code kind %q", origin.Code)
+	}
+	if protocol == PairingProtocolRaw {
+		// Raw pair-setup takes no code, whatever the caller offered.
+		origin.Code = PairingCodeNone
+	}
+	return cs.savePairingWith(deviceID, pairingID, pub, priv, protocol, receiver, origin, time.Now().UTC())
 }
 
 func (cs *CredentialStore) savePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol) error {
-	return cs.savePairingWith(deviceID, pairingID, pub, priv, protocol, nil)
+	return cs.savePairingWith(deviceID, pairingID, pub, priv, protocol, nil, PairingOrigin{}, time.Time{})
 }
 
-func (cs *CredentialStore) savePairingWith(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol, receiver *ReceiverIdentity) error {
+func (cs *CredentialStore) savePairingWith(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol, receiver *ReceiverIdentity, origin PairingOrigin, pairedAt time.Time) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -277,6 +315,13 @@ func (cs *CredentialStore) savePairingWith(deviceID string, pairingID string, pu
 	if receiver.valid() {
 		creds.ReceiverID = receiver.ID
 		creds.ReceiverPublicKey = append([]byte(nil), receiver.PublicKey...)
+	}
+	// Likewise: how and when an earlier pairing was made says nothing about
+	// this one.
+	creds.PairingCode = origin.Code
+	creds.PairedAt = ""
+	if !pairedAt.IsZero() {
+		creds.PairedAt = pairedAt.Format(time.RFC3339Nano)
 	}
 	return cs.backend.Save(deviceID, creds)
 }

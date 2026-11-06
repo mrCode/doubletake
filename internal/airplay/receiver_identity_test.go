@@ -309,7 +309,7 @@ func TestSavePairingRefusesAPairingWithoutTheReceiversIdentity(t *testing.T) {
 		{"short key", PairingProtocolHAP, &ReceiverIdentity{ID: "r", PublicKey: receiverKey[:16]}},
 		{"HAP without identifier", PairingProtocolHAP, &ReceiverIdentity{PublicKey: receiverKey}},
 	} {
-		if err := store.SavePairing("device", "pair-id", pub, key, test.protocol, test.receiver); err == nil {
+		if err := store.SavePairing("device", "pair-id", pub, key, test.protocol, test.receiver, PairingOrigin{Code: PairingCodePIN}); err == nil {
 			t.Errorf("%s: saved", test.name)
 		}
 		if store.Lookup("device") != nil {
@@ -319,11 +319,11 @@ func TestSavePairingRefusesAPairingWithoutTheReceiversIdentity(t *testing.T) {
 
 	// And a later pairing never inherits an earlier receiver's identity.
 	if err := store.SavePairing("device", "pair-id", pub, key, PairingProtocolHAP,
-		&ReceiverIdentity{ID: "first", PublicKey: receiverKey}); err != nil {
+		&ReceiverIdentity{ID: "first", PublicKey: receiverKey}, PairingOrigin{Code: PairingCodePIN}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SavePairing("device", "pair-id", pub, key, PairingProtocolRaw,
-		&ReceiverIdentity{PublicKey: receiverKey}); err != nil {
+		&ReceiverIdentity{PublicKey: receiverKey}, PairingOrigin{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := store.Lookup("device"); got == nil || got.ReceiverID != "" || !got.HasReceiverIdentity() {
@@ -402,7 +402,7 @@ func TestLookupReceiverUsesTheReceiverMeant(t *testing.T) {
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x42}, ed25519.SeedSize))
 	receiverKey := ed25519.NewKeyFromSeed(pinSetupReceiverSeed).Public().(ed25519.PublicKey)
 	if err := store.SavePairing("AA:BB:CC:DD:EE:01", "pair-id", key.Public().(ed25519.PublicKey), key,
-		PairingProtocolHAP, &ReceiverIdentity{ID: pinSetupReceiverID, PublicKey: receiverKey}); err != nil {
+		PairingProtocolHAP, &ReceiverIdentity{ID: pinSetupReceiverID, PublicKey: receiverKey}, PairingOrigin{Code: PairingCodePIN}); err != nil {
 		t.Fatal(err)
 	}
 
