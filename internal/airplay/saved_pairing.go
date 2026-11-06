@@ -2,6 +2,8 @@ package airplay
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 )
@@ -132,4 +134,39 @@ func (c *AirPlayClient) PairAgainWithCode(ctx context.Context, saved *SavedCrede
 		return PairingCodeNone, err
 	}
 	return PairingCodePIN, nil
+}
+
+// PairAgainRaw pairs again, with raw pair-setup and nothing else, with a
+// receiver whose saved pairing is a raw one made before receiver identities
+// were recorded (SavedPairingPairAsNew). On success ReceiverIdentity holds the
+// key the receiver gave, for SavePairing.
+//
+// The receiver paired with that way took no code, so whatever /info now
+// claims, none is offered: no PIN or password pair-setup with a preset code,
+// no Digest password on the client, and no transient fallback. A device that
+// asks for a code, or will not pair raw, is refused -- either the receiver
+// really changed, which only the user can confirm by removing its entry, or
+// something else answers at its address.
+func (c *AirPlayClient) PairAgainRaw(ctx context.Context) error {
+	const advice = "if the receiver really changed, remove its entry from the credentials file and connect again"
+	c.SetPassword("")
+	if c.info != nil && c.info.RequiredPairingCredential() != PairingCredentialNone {
+		return fmt.Errorf("%w: it was paired with without a code, but now asks for one; %s",
+			ErrReceiverNotAuthenticated, advice)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate ed25519: %w", err)
+	}
+	c.PairKeys = &PairKeys{Ed25519Public: pub, Ed25519Private: priv}
+	c.pairingProtocol = pairingProtocolUnknown
+	c.receiver = nil
+	if err := c.performRawSetupAndVerify(ctx); err != nil {
+		return fmt.Errorf("%w: it was paired with by raw pairing, which it no longer completes (%v); %s",
+			ErrReceiverNotAuthenticated, err, advice)
+	}
+	if c.ReceiverIdentity() == nil {
+		return fmt.Errorf("%w: raw pairing gave no receiver key; %s", ErrReceiverNotAuthenticated, advice)
+	}
+	return nil
 }

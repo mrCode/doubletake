@@ -1,11 +1,16 @@
 package airplay
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestAfterSavedPairingNeverFallsBackToTransient(t *testing.T) {
@@ -61,5 +66,53 @@ func TestAfterSavedPairingNeverFallsBackToTransient(t *testing.T) {
 				t.Errorf("verify called = %t, want %t", verified, test.wantVerified)
 			}
 		})
+	}
+}
+
+// Raw pairing takes no code, so pairing again raw sends no Digest of the
+// preset code, even with one installed on the client.
+func TestPairAgainRawSendsNoCode(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = serverConn.SetDeadline(time.Now().Add(5 * time.Second))
+	client := NewAirPlayClient("127.0.0.1", 7000)
+	client.conn = clientConn
+	client.info = &ReceiverInfo{}
+	client.SetPassword("preset-code")
+
+	served := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(serverConn)
+		for {
+			request, err := readRTSPTestRequest(reader)
+			if err != nil {
+				served <- nil
+				return
+			}
+			if auth := request.headers["authorization"]; auth != "" {
+				served <- fmt.Errorf("%s %s carried Authorization %q", request.method, request.uri, auth)
+				return
+			}
+			if request.uri == "/pair-setup" && len(request.body) != 32 {
+				served <- fmt.Errorf("pair-setup body is %d bytes, not raw pair-setup", len(request.body))
+				return
+			}
+			if err := writeRTSPTestResponse(serverConn, 401, map[string]string{
+				"WWW-Authenticate": `Digest realm="airplay", nonce="impostor-nonce"`,
+			}, nil); err != nil {
+				served <- err
+				return
+			}
+		}
+	}()
+
+	err := client.PairAgainRaw(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "remove its entry from the credentials file") {
+		t.Fatalf("PairAgainRaw against a challenging device = %v, want a refusal with advice", err)
+	}
+	clientConn.Close()
+	if err := <-served; err != nil {
+		t.Fatal(err)
 	}
 }

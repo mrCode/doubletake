@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -443,3 +444,163 @@ type lookupOnlyBackend struct{}
 
 func (lookupOnlyBackend) Lookup(string) (*SavedCredentials, error) { return nil, nil }
 func (lookupOnlyBackend) Save(string, *SavedCredentials) error     { return nil }
+
+// A paired_at in the future is as unreadable as a missing one: a clock that
+// ran ahead, or an edit, must not let one pairing outrank every later one.
+func TestReceiverAtAddressTreatsAFuturePairedAtAsOldest(t *testing.T) {
+	pub, priv, receiver := testPairingKeys(t)
+	entry := func(pairedAt time.Time) *SavedCredentials {
+		return &SavedCredentials{
+			PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(),
+			PairingProtocol: PairingProtocolHAP, ReceiverID: receiver.ID, ReceiverPublicKey: receiver.PublicKey,
+			PairingCode: PairingCodePIN, PairedAt: pairedAt.UTC().Format(time.RFC3339Nano), ReceiverAddress: "192.168.1.5",
+		}
+	}
+	now := time.Now()
+	for _, test := range []struct {
+		name   string
+		future time.Duration
+		want   string
+	}{
+		{"an hour ahead counts as oldest", time.Hour, "PAST"},
+		{"a day ahead counts as oldest", 24 * time.Hour, "PAST"},
+		{"within the slack is a time like any other", 2 * time.Minute, "AHEAD"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credentials.json")
+			data, err := json.Marshal(map[string]*SavedCredentials{
+				"AHEAD": entry(now.Add(test.future)), "PAST": entry(now.Add(-24 * time.Hour)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewCredentialStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding, err := store.BindingAt("192.168.1.5")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if binding.DeviceID != test.want || len(binding.Tied) != 0 {
+				t.Fatalf("binding = %+v, want %q", binding, test.want)
+			}
+		})
+	}
+}
+
+// A tie at an address binds the tied receivers, not nothing: either of them
+// may answer there, a third may not.
+func TestAddressBindingAdmitsOnlyTheReceiversPairedThere(t *testing.T) {
+	single := AddressBinding{Address: "192.168.1.5", DeviceID: "AA:AA"}
+	tie := AddressBinding{Address: "192.168.1.5", Tied: []string{"AA:AA", "BB:BB"}}
+	none := AddressBinding{Address: "192.168.1.5"}
+
+	if !single.Bound() || !tie.Bound() || none.Bound() {
+		t.Fatalf("Bound = %t/%t/%t, want true/true/false", single.Bound(), tie.Bound(), none.Bound())
+	}
+	for _, test := range []struct {
+		name     string
+		binding  AddressBinding
+		reported string
+		want     string
+		refused  bool
+	}{
+		{"bound receiver", single, "AA:AA", "AA:AA", false},
+		// LookupReceiver refuses the mismatch; the binding only names the
+		// receiver meant.
+		{"bound, another reported", single, "CC:CC", "AA:AA", false},
+		{"tie, one of them", tie, "bb:bb", "BB:BB", false},
+		{"tie, a third", tie, "CC:CC", "", true},
+		{"unbound", none, "CC:CC", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.binding.ReceiverMeant(test.reported)
+			if test.refused {
+				if !errors.Is(err, ErrReceiverNotAuthenticated) {
+					t.Fatalf("ReceiverMeant(%q) = (%q, %v), want a refusal", test.reported, got, err)
+				}
+				for _, id := range test.binding.Tied {
+					if !strings.Contains(err.Error(), id) {
+						t.Fatalf("refusal %q does not name %s", err, id)
+					}
+				}
+				if !strings.Contains(err.Error(), "remove the stale entry") {
+					t.Fatalf("refusal %q does not say what to do", err)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("ReceiverMeant(%q) = (%q, %v), want %q", test.reported, got, err, test.want)
+			}
+		})
+	}
+	for _, test := range []struct {
+		binding AddressBinding
+		id      string
+		want    bool
+	}{
+		{single, "aa:aa", true}, {single, "BB:BB", false},
+		{tie, "AA:AA", true}, {tie, "bb:bb", true}, {tie, "CC:CC", false},
+		{none, "CC:CC", true},
+	} {
+		if got := test.binding.Admits(test.id); got != test.want {
+			t.Errorf("%+v.Admits(%q) = %t, want %t", test.binding, test.id, got, test.want)
+		}
+	}
+}
+
+// A receiver that proved its saved identity at an address is bound to it,
+// even if its pairing was saved before addresses were recorded.
+func TestBindAddressRecordsAProvenReceiversAddress(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store, err := NewCredentialStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, receiver := testPairingKeys(t)
+	if err := store.SavePairing("OLD", "pair-id", pub, priv, PairingProtocolHAP, receiver,
+		PairingOrigin{Code: PairingCodePIN, Address: "living-room.local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePairing("PROVEN", "pair-id", pub, priv, PairingProtocolHAP, receiver,
+		PairingOrigin{Code: PairingCodePIN}); err != nil {
+		t.Fatal(err)
+	}
+	pairedAt := store.Lookup("PROVEN").PairedAt
+
+	// The first ID given that has a pairing is the one bound.
+	if err := store.BindAddress("Living-Room.local", "missing", "PROVEN"); err != nil {
+		t.Fatal(err)
+	}
+	proven := store.Lookup("PROVEN")
+	if proven.ReceiverAddress != "Living-Room.local" {
+		t.Fatalf("receiver_address = %q, want the address it proved itself at", proven.ReceiverAddress)
+	}
+	if proven.PairedAt != pairedAt {
+		t.Fatalf("paired_at changed from %q to %q; binding is not pairing", pairedAt, proven.PairedAt)
+	}
+	if got := store.Lookup("OLD").ReceiverAddress; got != "" {
+		t.Fatalf("the other entry kept the address %q", got)
+	}
+	reloaded, err := NewCredentialStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding, _ := reloaded.BindingAt("living-room.local"); binding.DeviceID != "PROVEN" {
+		t.Fatalf("binding after reload = %+v", binding)
+	}
+
+	if err := store.BindAddress("192.168.1.9", "missing"); err == nil {
+		t.Fatal("bound an address to a receiver with no pairing")
+	}
+	if err := store.BindAddress("", "PROVEN"); err != nil {
+		t.Fatalf("an empty address: %v", err)
+	}
+	if got := store.Lookup("PROVEN").ReceiverAddress; got != "Living-Room.local" {
+		t.Fatalf("an empty address changed the binding to %q", got)
+	}
+}

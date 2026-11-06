@@ -266,9 +266,11 @@ func (cs *CredentialStore) lookup(deviceID string) (*SavedCredentials, error) {
 //
 // SavePairing keeps one entry per address, but castr copies pairings between
 // its credential files one receiver at a time, so a file can hold several.
-// The newest paired_at wins; an entry whose paired_at is missing or
-// unparsable counts as oldest. When the newest cannot be told apart, nothing
-// is returned and tied names them, so the caller can say so.
+// The newest paired_at wins; an entry whose paired_at is missing, unparsable
+// or more than pairedAtSlack in the future counts as oldest -- a clock that
+// ran ahead, or an edit, would otherwise outrank every later pairing for good.
+// When the newest cannot be told apart, deviceID is empty and tied names them;
+// AddressBinding.ReceiverMeant then admits only those.
 //
 // A backend that cannot list its entries binds nothing.
 func (cs *CredentialStore) ReceiverAtAddress(address string) (deviceID string, tied []string, err error) {
@@ -286,11 +288,15 @@ func (cs *CredentialStore) ReceiverAtAddress(address string) (deviceID string, t
 		return "", nil, fmt.Errorf("read saved pairings: %w", err)
 	}
 	var newest time.Time
+	latest := time.Now().Add(pairedAtSlack)
 	for id, creds := range entries {
 		if !creds.HasPairingCredentials() || !strings.EqualFold(creds.ReceiverAddress, address) {
 			continue
 		}
-		pairedAt, _ := time.Parse(time.RFC3339Nano, creds.PairedAt)
+		pairedAt, err := time.Parse(time.RFC3339Nano, creds.PairedAt)
+		if err != nil || pairedAt.After(latest) {
+			pairedAt = time.Time{}
+		}
 		switch {
 		case (deviceID == "" && tied == nil) || pairedAt.After(newest):
 			deviceID, tied, newest = id, nil, pairedAt
@@ -304,6 +310,105 @@ func (cs *CredentialStore) ReceiverAtAddress(address string) (deviceID string, t
 	}
 	sort.Strings(tied)
 	return deviceID, tied, nil
+}
+
+// pairedAtSlack is how far in the future a paired_at may be, for clocks that
+// differ a little between the machines a credentials file has been on, and
+// still count as the time it says.
+const pairedAtSlack = 5 * time.Minute
+
+// AddressBinding is what a store says about the receiver at an address: the
+// one last paired there, or, when the newest pairings there cannot be told
+// apart, those tied for newest. Either way the device at the address must be
+// one of them while they have pairings.
+type AddressBinding struct {
+	Address  string
+	DeviceID string
+	Tied     []string
+}
+
+// Bound reports whether any receiver is held to the address.
+func (b AddressBinding) Bound() bool {
+	return b.DeviceID != "" || len(b.Tied) > 0
+}
+
+// Admits reports whether id may be the receiver at the address. An unbound
+// address admits anything.
+func (b AddressBinding) Admits(id string) bool {
+	if b.DeviceID != "" {
+		return strings.EqualFold(b.DeviceID, id)
+	}
+	if len(b.Tied) == 0 {
+		return true
+	}
+	for _, tied := range b.Tied {
+		if strings.EqualFold(tied, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// ReceiverMeant returns the receiver the address names, for a device there
+// that reports reportedID: the bound receiver (which LookupReceiver then
+// holds the device to), or, after a tie, the tied receiver it names itself
+// as. A tie fails closed: either tied receiver may be the one there, a third
+// never is. An unbound address names nothing.
+func (b AddressBinding) ReceiverMeant(reportedID string) (string, error) {
+	if b.DeviceID != "" || len(b.Tied) == 0 {
+		return b.DeviceID, nil
+	}
+	for _, tied := range b.Tied {
+		if strings.EqualFold(tied, reportedID) {
+			return tied, nil
+		}
+	}
+	return "", fmt.Errorf("%w: the device at %s names itself %q, but this machine paired there with %s, "+
+		"recorded as paired at the same time, and it is none of them; remove the stale entry from the "+
+		"credentials file", ErrReceiverNotAuthenticated, b.Address, reportedID, strings.Join(b.Tied, " and "))
+}
+
+// BindingAt is ReceiverAtAddress as an AddressBinding.
+func (cs *CredentialStore) BindingAt(address string) (AddressBinding, error) {
+	deviceID, tied, err := cs.ReceiverAtAddress(address)
+	return AddressBinding{Address: address, DeviceID: deviceID, Tied: tied}, err
+}
+
+// BindAddress records address on the entry of the first of deviceIDs that has
+// a saved pairing, removing it from every other entry, as SavePairing does.
+// paired_at is left alone: the pairing is no newer for being found here.
+//
+// Call it only once the receiver has proven, at this address, that it holds
+// the saved pairing's identity -- a pairing saved before addresses were
+// recorded otherwise never gets one, and a receiver reached by address alone
+// stays unprotected.
+func (cs *CredentialStore) BindAddress(address string, deviceIDs ...string) error {
+	if address == "" {
+		return nil
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for _, deviceID := range deviceIDs {
+		if deviceID == "" {
+			continue
+		}
+		creds, err := cs.backend.Lookup(deviceID)
+		if err != nil {
+			return err
+		}
+		if !creds.HasPairingCredentials() {
+			continue
+		}
+		if err := cs.releaseAddressLocked(address, deviceID); err != nil {
+			return err
+		}
+		if creds.ReceiverAddress == address {
+			return nil
+		}
+		creds.ReceiverAddress = address
+		return cs.backend.Save(deviceID, creds)
+	}
+	return fmt.Errorf("no saved pairing to bind %s to", address)
 }
 
 // Len returns the number of stored credential entries.
