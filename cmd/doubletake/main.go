@@ -181,11 +181,27 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load credentials: %v", err)
 	}
-	// The receiver meant: as given, or as discovery advertised it when it was
-	// picked. Without either, the device at -target is taken at its word.
+	// The receiver meant: as given, as discovery advertised it when it was
+	// picked, or the one last paired at -target. Without any, the device at
+	// -target is taken at its word.
 	expectedID := *expectedDeviceID
 	if expectedID == "" && advertisement != nil {
 		expectedID = advertisement.DeviceID
+	}
+	boundByAddress := false
+	if expectedID == "" && *target != "" && !*forcePair {
+		// With -pair the user is pairing deliberately with whatever is at the
+		// address now, so the receiver paired there before does not refuse
+		// it; the new pairing takes the address over.
+		bound, tied, err := credStore.ReceiverAtAddress(addr)
+		if err != nil {
+			log.Fatalf("%v; refusing to cast", err)
+		}
+		if len(tied) > 0 {
+			log.Printf("warning: the saved pairings for %s were all made at %s at the same time; "+
+				"not taking any of them as the receiver there", strings.Join(tied, " and "), addr)
+		}
+		expectedID, boundByAddress = bound, bound != ""
 	}
 	// A receiver this machine holds a proven identity for must prove it again
 	// before the code goes anywhere: the client answers any 401 with an MD5
@@ -246,6 +262,11 @@ func main() {
 	}
 	savedCreds, err := credStore.LookupReceiver(expectedID, info.DeviceID)
 	if err != nil {
+		if boundByAddress && errors.Is(err, airplay.ErrReceiverNotAuthenticated) {
+			log.Fatalf("%v; refusing to cast. %s is the receiver this machine paired with at %s; "+
+				"if a different receiver now has that address, pair with it explicitly: run again "+
+				"with -pair and enter the code it shows.", err, expectedID, addr)
+		}
 		log.Fatalf("%v; refusing to cast", err)
 	}
 	pairedWithCode := savedCreds.HasPairingCredentials() && !savedCreds.UsesRawPairing()
@@ -288,7 +309,7 @@ func main() {
 		}
 		if err := credStore.SavePairing(info.DeviceID, client.PairingID,
 			client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
-			client.PairingProtocol(), receiver, airplay.PairingOrigin{Code: kind}); err != nil {
+			client.PairingProtocol(), receiver, airplay.PairingOrigin{Code: kind, Address: addr}); err != nil {
 			log.Printf("warning: failed to save credentials: %v", err)
 		} else {
 			log.Printf("credentials saved (%s)", *credBackend)

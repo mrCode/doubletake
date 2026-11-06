@@ -301,3 +301,145 @@ func TestSavePairingRecordsTheCodeKindAndWhen(t *testing.T) {
 		t.Fatal("an unknown kind of code was written")
 	}
 }
+
+func testPairingKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey, *ReceiverIdentity) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub, priv, &ReceiverIdentity{ID: "receiver-id", PublicKey: receiverPub}
+}
+
+// The address a receiver was paired at names it when nothing else does, so
+// only one entry may hold an address: the latest receiver paired there.
+func TestSavePairingBindsTheReceiverToItsAddress(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store, err := NewCredentialStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, receiver := testPairingKeys(t)
+	save := func(deviceID, address string) {
+		t.Helper()
+		if err := store.SavePairing(deviceID, "pair-id", pub, priv, PairingProtocolHAP, receiver,
+			PairingOrigin{Code: PairingCodePIN, Address: address}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bound := func(address string) string {
+		t.Helper()
+		deviceID, tied, err := store.ReceiverAtAddress(address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tied) != 0 {
+			t.Fatalf("ReceiverAtAddress(%q) tied %v", address, tied)
+		}
+		return deviceID
+	}
+
+	save("AA:AA:AA:AA:AA:01", "Living-Room.local")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"receiver_address": "Living-Room.local"`) {
+		t.Fatalf("receiver_address not saved:\n%s", data)
+	}
+	if got := bound("living-room.LOCAL"); got != "AA:AA:AA:AA:AA:01" {
+		t.Fatalf("receiver at the address = %q, want the one paired there", got)
+	}
+	if got := bound("192.168.1.9"); got != "" {
+		t.Fatalf("receiver at an address never paired at = %q", got)
+	}
+
+	// A second receiver paired at the same address takes it over.
+	save("BB:BB:BB:BB:BB:02", "living-room.local")
+	if got := bound("Living-Room.local"); got != "BB:BB:BB:BB:BB:02" {
+		t.Fatalf("receiver at the address = %q, want the one paired there last", got)
+	}
+	if got := store.Lookup("AA:AA:AA:AA:AA:01"); got.ReceiverAddress != "" || !got.HasReceiverIdentity() {
+		t.Fatalf("first receiver after losing its address = %+v, want its pairing without the address", got)
+	}
+
+	// A pairing saved with no address leaves other entries' addresses alone.
+	save("CC:CC:CC:CC:CC:03", "")
+	if got := bound("living-room.local"); got != "BB:BB:BB:BB:BB:02" {
+		t.Fatalf("receiver at the address = %q after an unrelated pairing", got)
+	}
+}
+
+// castr copies pairings between its mode files one receiver at a time, so a
+// file can hold two entries with the same address. The newest pairing is the
+// one at the address; when that cannot be told, neither is.
+func TestReceiverAtAddressPrefersTheNewestPairing(t *testing.T) {
+	pub, priv, receiver := testPairingKeys(t)
+	entry := func(pairedAt string) *SavedCredentials {
+		return &SavedCredentials{
+			PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(),
+			PairingProtocol: PairingProtocolHAP, ReceiverID: receiver.ID, ReceiverPublicKey: receiver.PublicKey,
+			PairingCode: PairingCodePIN, PairedAt: pairedAt, ReceiverAddress: "192.168.1.5",
+		}
+	}
+	const (
+		older = "2026-10-01T10:00:00Z"
+		newer = "2026-11-01T10:00:00.5Z"
+	)
+	for _, test := range []struct {
+		name      string
+		a, b      string
+		want      string
+		wantTied  []string
+		otherAddr bool
+	}{
+		{name: "newer wins", a: older, b: newer, want: "BB"},
+		{name: "newer wins either way round", a: newer, b: older, want: "AA"},
+		{name: "missing counts as oldest", a: "", b: older, want: "BB"},
+		{name: "unparsable counts as oldest", a: newer, b: "last tuesday", want: "AA"},
+		{name: "tie", a: newer, b: newer, wantTied: []string{"AA", "BB"}},
+		{name: "both missing is a tie", a: "", b: "not a time", wantTied: []string{"AA", "BB"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credentials.json")
+			data, err := json.Marshal(map[string]*SavedCredentials{
+				"AA": entry(test.a), "BB": entry(test.b),
+				"CC": {PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(), ReceiverAddress: "192.168.1.6"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewCredentialStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, tied, err := store.ReceiverAtAddress("192.168.1.5")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want || strings.Join(tied, ",") != strings.Join(test.wantTied, ",") {
+				t.Fatalf("ReceiverAtAddress = (%q, %v), want (%q, %v)", got, tied, test.want, test.wantTied)
+			}
+		})
+	}
+}
+
+// A backend that cannot list its entries cannot say who was paired where.
+func TestReceiverAtAddressWithoutAListableBackend(t *testing.T) {
+	store := NewCredentialStoreWithBackend(lookupOnlyBackend{})
+	if got, tied, err := store.ReceiverAtAddress("192.168.1.5"); got != "" || tied != nil || err != nil {
+		t.Fatalf("ReceiverAtAddress = (%q, %v, %v), want no binding", got, tied, err)
+	}
+}
+
+type lookupOnlyBackend struct{}
+
+func (lookupOnlyBackend) Lookup(string) (*SavedCredentials, error) { return nil, nil }
+func (lookupOnlyBackend) Save(string, *SavedCredentials) error     { return nil }

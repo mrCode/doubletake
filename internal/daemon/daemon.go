@@ -903,6 +903,20 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		}
 		d.mu.Unlock()
 	}
+	boundByAddress := false
+	if expectedDeviceID == "" {
+		// Or the receiver last paired at this address.
+		bound, tied, err := d.credStore.ReceiverAtAddress(target)
+		if err != nil {
+			removeStream(fmt.Sprintf("%v; refusing to cast", err))
+			return
+		}
+		if len(tied) > 0 {
+			log.Printf("[daemon] warning: the saved pairings for %s were all made at %s at the same time; "+
+				"not taking any of them as the receiver there", strings.Join(tied, " and "), target)
+		}
+		expectedDeviceID, boundByAddress = bound, bound != ""
+	}
 	// A receiver this machine holds a proven identity for must prove it again
 	// before the credential goes anywhere: the client answers any 401 with an
 	// MD5 Digest of it, crackable offline when the code is short, and a device
@@ -977,6 +991,12 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 	savedCreds, err := d.credStore.LookupReceiver(expectedDeviceID, deviceID)
 	if err != nil {
+		if boundByAddress && errors.Is(err, airplay.ErrReceiverNotAuthenticated) {
+			removeStream(fmt.Sprintf("%v; refusing to cast. %s is the receiver this machine paired with at "+
+				"%s; if a different receiver now has that address, pair with it explicitly by connecting "+
+				"with its device_id.", err, expectedDeviceID, target))
+			return
+		}
 		removeStream(fmt.Sprintf("%v; refusing to cast", err))
 		return
 	}
@@ -1019,7 +1039,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		if receiver := client.ReceiverIdentity(); client.PairKeys != nil && receiver != nil {
 			if err := d.credStore.SavePairing(deviceID, client.PairingID,
 				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
-				client.PairingProtocol(), receiver, airplay.PairingOrigin{Code: kind}); err != nil {
+				client.PairingProtocol(), receiver, airplay.PairingOrigin{Code: kind, Address: target}); err != nil {
 				log.Printf("[daemon] warning: failed to save credentials: %v", err)
 			} else {
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)

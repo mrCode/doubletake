@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +34,14 @@ type SavedCredentials struct {
 	// writes: an impersonator claiming a pairing password would otherwise be
 	// handed the preset code, or a Digest of it, without showing any PIN.
 	// Raw pairings, made with no code, leave it empty.
-	PairingCode  PairingCode `json:"pairing_code,omitempty"`
-	RestoreToken string      `json:"restore_token,omitempty"`
+	PairingCode PairingCode `json:"pairing_code,omitempty"`
+	// ReceiverAddress is the host this machine was told to connect to when
+	// it made the pairing. Reaching a receiver by address alone, the device
+	// there is otherwise taken at its word about which receiver it is; the
+	// address names the receiver meant instead. Only one entry in a store
+	// holds a given address.
+	ReceiverAddress string `json:"receiver_address,omitempty"`
+	RestoreToken    string `json:"restore_token,omitempty"`
 }
 
 // PairingCode is the kind of code a pairing was made with.
@@ -52,6 +59,9 @@ const (
 type PairingOrigin struct {
 	// Code is the kind of code pair-setup was given.
 	Code PairingCode
+	// Address is the host connected to, which the pairing takes over from
+	// any other entry. Empty leaves addresses as they are.
+	Address string
 }
 
 // PairingProtocol is the pair-verify wire protocol negotiated when credentials
@@ -165,6 +175,13 @@ type CredentialBackend interface {
 	Save(deviceID string, creds *SavedCredentials) error
 }
 
+// listingBackend is a CredentialBackend that can also list its entries,
+// which binding receivers to addresses needs.
+type listingBackend interface {
+	CredentialBackend
+	All() (map[string]*SavedCredentials, error)
+}
+
 // CredentialStore manages per-device pairing credentials using a pluggable backend.
 type CredentialStore struct {
 	mu      sync.Mutex
@@ -242,6 +259,53 @@ func (cs *CredentialStore) lookup(deviceID string) (*SavedCredentials, error) {
 	return creds, nil
 }
 
+// ReceiverAtAddress returns the device ID of the receiver this machine last
+// paired with at address (a host, compared case-insensitively), or "" if
+// none. A receiver reached only by address can then be held to the one paired
+// there, rather than to whatever the device at the address says it is.
+//
+// SavePairing keeps one entry per address, but castr copies pairings between
+// its credential files one receiver at a time, so a file can hold several.
+// The newest paired_at wins; an entry whose paired_at is missing or
+// unparsable counts as oldest. When the newest cannot be told apart, nothing
+// is returned and tied names them, so the caller can say so.
+//
+// A backend that cannot list its entries binds nothing.
+func (cs *CredentialStore) ReceiverAtAddress(address string) (deviceID string, tied []string, err error) {
+	if address == "" {
+		return "", nil, nil
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	lister, ok := cs.backend.(listingBackend)
+	if !ok {
+		return "", nil, nil
+	}
+	entries, err := lister.All()
+	if err != nil {
+		return "", nil, fmt.Errorf("read saved pairings: %w", err)
+	}
+	var newest time.Time
+	for id, creds := range entries {
+		if !creds.HasPairingCredentials() || !strings.EqualFold(creds.ReceiverAddress, address) {
+			continue
+		}
+		pairedAt, _ := time.Parse(time.RFC3339Nano, creds.PairedAt)
+		switch {
+		case (deviceID == "" && tied == nil) || pairedAt.After(newest):
+			deviceID, tied, newest = id, nil, pairedAt
+		case pairedAt.Equal(newest):
+			if deviceID != "" {
+				tied = append(tied, deviceID)
+				deviceID = ""
+			}
+			tied = append(tied, id)
+		}
+	}
+	sort.Strings(tied)
+	return deviceID, tied, nil
+}
+
 // Len returns the number of stored credential entries.
 // Only supported by the file backend; returns 0 for other backends.
 func (cs *CredentialStore) Len() int {
@@ -302,6 +366,13 @@ func (cs *CredentialStore) savePairingWith(deviceID string, pairingID string, pu
 	if creds == nil {
 		creds = &SavedCredentials{}
 	}
+	if origin.Address != "" {
+		// The address now names this receiver, and no other.
+		if err := cs.releaseAddressLocked(origin.Address, deviceID); err != nil {
+			return err
+		}
+		creds.ReceiverAddress = origin.Address
+	}
 	creds.PairingID = pairingID
 	creds.Ed25519Public = append([]byte(nil), pub...)
 	creds.Ed25519Seed = append([]byte(nil), priv.Seed()...)
@@ -324,6 +395,28 @@ func (cs *CredentialStore) savePairingWith(deviceID string, pairingID string, pu
 		creds.PairedAt = pairedAt.Format(time.RFC3339Nano)
 	}
 	return cs.backend.Save(deviceID, creds)
+}
+
+// releaseAddressLocked removes address from every entry but keepID's.
+func (cs *CredentialStore) releaseAddressLocked(address, keepID string) error {
+	lister, ok := cs.backend.(listingBackend)
+	if !ok {
+		return nil
+	}
+	entries, err := lister.All()
+	if err != nil {
+		return fmt.Errorf("read saved pairings: %w", err)
+	}
+	for id, creds := range entries {
+		if id == keepID || !strings.EqualFold(creds.ReceiverAddress, address) {
+			continue
+		}
+		creds.ReceiverAddress = ""
+		if err := cs.backend.Save(id, creds); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SaveRestoreToken stores a Wayland screencast restore token for a device.
@@ -372,6 +465,10 @@ func newFileBackend(path string) (*fileBackend, error) {
 
 func (fb *fileBackend) Lookup(deviceID string) (*SavedCredentials, error) {
 	return fb.devices[deviceID], nil
+}
+
+func (fb *fileBackend) All() (map[string]*SavedCredentials, error) {
+	return fb.devices, nil
 }
 
 func (fb *fileBackend) Save(deviceID string, creds *SavedCredentials) error {

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -181,6 +182,12 @@ var (
 
 func savedPairingDaemon(t *testing.T, code airplay.PairingCode) *Daemon {
 	t.Helper()
+	return savedPairingDaemonAt(t, code, "")
+}
+
+// savedPairingDaemonAt is savedPairingDaemon with the pairing made at address.
+func savedPairingDaemonAt(t *testing.T, code airplay.PairingCode, address string) *Daemon {
+	t.Helper()
 	own := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x42}, ed25519.SeedSize))
 	receiver := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x51}, ed25519.SeedSize))
 	entries := map[string]*airplay.SavedCredentials{savedPairingDeviceID: {
@@ -191,6 +198,8 @@ func savedPairingDaemon(t *testing.T, code airplay.PairingCode) *Daemon {
 		ReceiverID:        "receiver-test-id",
 		ReceiverPublicKey: receiver.Public().(ed25519.PublicKey),
 		PairingCode:       code,
+		ReceiverAddress:   address,
+		PairedAt:          "2026-10-01T10:00:00Z",
 	}}
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	data, err := json.Marshal(entries)
@@ -373,6 +382,9 @@ func TestDaemonFirstPairingRecordsTheKindOfCode(t *testing.T) {
 			if entry.PairingCode != test.want || entry.PairedAt == "" {
 				t.Fatalf("saved pairing_code %q paired_at %q, want %q and a time", entry.PairingCode, entry.PairedAt, test.want)
 			}
+			if entry.ReceiverAddress != addr.IP.String() {
+				t.Fatalf("saved receiver_address %q, want %q", entry.ReceiverAddress, addr.IP.String())
+			}
 		})
 	}
 }
@@ -380,6 +392,12 @@ func TestDaemonFirstPairingRecordsTheKindOfCode(t *testing.T) {
 // Holding the password back until the receiver proves itself must not cost
 // the real receiver its Digest: once pair-verify succeeds, SETUP is answered.
 func TestDaemonSavedReceiverGetsThePasswordOnceVerified(t *testing.T) {
+	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+		t.Skip("gst-launch-1.0 is required to start streaming")
+	}
+	if err := exec.Command("gst-inspect-1.0", "openh264enc").Run(); err != nil {
+		t.Skip("GStreamer openh264enc is required to start streaming")
+	}
 	const code = "combined password"
 	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
 		ListenAddress: "127.0.0.1:0",
@@ -430,5 +448,37 @@ func TestDaemonSavedReceiverGetsThePasswordOnceVerified(t *testing.T) {
 	}
 	if after.DigestChallenges == before.DigestChallenges {
 		t.Fatal("second connect was never challenged; this test no longer shows the Digest being answered")
+	}
+}
+
+// A receiver reached by address alone is the one paired at that address; a
+// device there naming itself as a receiver never seen is refused.
+func TestDaemonRefusesADeviceAtABoundAddressNamingItselfAnew(t *testing.T) {
+	info, err := plist.Marshal(map[string]any{
+		"name": "Impostor", "model": "AppleTV-Test", "deviceID": "11:22:33:44:55:66",
+		"features": savedPairingModernFeatures, "statusFlags": uint64(0),
+	}, plist.BinaryFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := startSavedPairingDevice(t, func(conn int, path string) (int, map[string]string, []byte) {
+		if path == "/info" {
+			return 200, map[string]string{"Content-Type": "application/x-apple-binary-plist"}, info
+		}
+		return 500, nil, nil
+	})
+	d := savedPairingDaemonAt(t, airplay.PairingCodePIN, "127.0.0.1")
+	port := device.listener.Addr().(*net.TCPAddr).Port
+	if response := d.handleConnect(Request{Cmd: "connect", Target: "127.0.0.1", Port: port}); !response.OK {
+		t.Fatalf("connect rejected: %+v", response)
+	}
+	failure := waitForSavedPairingError(t, d)
+	if !strings.Contains(failure, "if a different receiver now has that address") {
+		t.Fatalf("failure = %q, want a refusal naming the receiver paired at the address", failure)
+	}
+	for _, request := range device.seen() {
+		if request.path != "/info" {
+			t.Fatalf("sent %s %s to a device refused at a bound address", request.method, request.path)
+		}
 	}
 }

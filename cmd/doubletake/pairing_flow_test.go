@@ -567,13 +567,32 @@ func TestFirstPairingRecordsTheKindOfCode(t *testing.T) {
 			if entry.PairedAt == "" {
 				t.Fatal("paired_at was not saved")
 			}
+			if entry.ReceiverAddress != "127.0.0.1" {
+				t.Fatalf("receiver_address = %q, want the -target host", entry.ReceiverAddress)
+			}
 		})
 	}
 }
 
 // Holding the password back until the receiver proves itself must not cost
 // the real receiver its Digest: once pair-verify succeeds, SETUP is answered.
+// Named by -device-id, or by the address it was paired at.
 func TestSavedReceiverGetsThePasswordOnceVerified(t *testing.T) {
+	t.Run("-device-id", func(t *testing.T) {
+		testSavedReceiverGetsThePasswordOnceVerified(t, "-device-id", testReceiverDeviceID)
+	})
+	t.Run("address", func(t *testing.T) { testSavedReceiverGetsThePasswordOnceVerified(t) })
+}
+
+func testSavedReceiverGetsThePasswordOnceVerified(t *testing.T, args ...string) {
+	// Reaching RECORD starts the synthetic capture.
+	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+		t.Skip("gst-launch-1.0 is required to reach RECORD")
+	}
+	if err := exec.Command("gst-inspect-1.0", "openh264enc").Run(); err != nil {
+		t.Skip("GStreamer openh264enc is required to reach RECORD")
+	}
+	args = append([]string{"-hwaccel", "openh264"}, args...)
 	const code = "combined password"
 	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
 		ListenAddress: "127.0.0.1:0",
@@ -601,14 +620,14 @@ func TestSavedReceiverGetsThePasswordOnceVerified(t *testing.T) {
 		store, err := airplay.NewCredentialStore(credFile)
 		return err == nil && store.Lookup(testReceiverDeviceID).HasReceiverIdentity()
 	}
-	output := startCLIUntil(t, port, credFile, code, "", paired, "-device-id", testReceiverDeviceID)
+	output := startCLIUntil(t, port, credFile, code, "", paired, args...)
 	if !paired() {
 		t.Fatalf("first run saved no pairing:\n%s", output)
 	}
 
 	before := server.Stats()
 	recorded := func() bool { return server.Stats().RecordRequests > before.RecordRequests }
-	output = startCLIUntil(t, port, credFile, code, "", recorded, "-device-id", testReceiverDeviceID)
+	output = startCLIUntil(t, port, credFile, code, "", recorded, args...)
 	after := server.Stats()
 	if !recorded() {
 		t.Fatalf("second run did not reach RECORD:\n%s", output)
@@ -619,4 +638,154 @@ func TestSavedReceiverGetsThePasswordOnceVerified(t *testing.T) {
 	if after.DigestChallenges == before.DigestChallenges {
 		t.Fatal("second run was never challenged; this test no longer shows the Digest being answered")
 	}
+}
+
+const boundDeviceID = "AA:BB:CC:DD:EE:0B"
+
+// boundEntry is a pairing made with a receiver at 127.0.0.1 earlier.
+func boundEntry() *airplay.SavedCredentials {
+	entry := savedEntry(airplay.PairingCodePIN, true)
+	entry.ReceiverAddress = "127.0.0.1"
+	entry.PairedAt = "2026-10-01T10:00:00Z"
+	return entry
+}
+
+// A receiver reached by address alone is the one paired at that address. A
+// device that takes the address over and names itself as a receiver never
+// seen, needing no code, used to be paired with transiently and given the
+// screen.
+func TestDeviceAtABoundAddressNamingItselfAnewIsRefused(t *testing.T) {
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		if request.path == "/info" {
+			return infoResponse(t, "11:22:33:44:55:66", modernTestFeatures, 0)
+		}
+		return scriptedResponse{status: 500}
+	})
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{boundDeviceID: boundEntry()})
+	run := runCLI(t, receiver, credFile, "", "")
+	if run.err == nil {
+		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	}
+	if !strings.Contains(run.output, "if a different receiver now has that address, pair with it explicitly") ||
+		!strings.Contains(run.output, "-pair") {
+		t.Fatalf("the refusal does not say what to do:\n%s", run.output)
+	}
+	if strings.Contains(run.output, "warning: no -device-id") {
+		t.Fatalf("warned of no -device-id although the address names the receiver:\n%s", run.output)
+	}
+	for _, request := range receiver.seen() {
+		if request.path != "/info" {
+			t.Fatalf("sent %s %s to a device refused at a bound address", request.method, request.path)
+		}
+	}
+}
+
+// Without -device-id or a receiver paired at the address, the device at
+// -target is taken at its word, as before, with a warning.
+func TestNoAddressBindingKeepsTheOldBehaviour(t *testing.T) {
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		if request.path == "/info" {
+			return infoResponse(t, "11:22:33:44:55:66", modernTestFeatures, 0)
+		}
+		return scriptedResponse{status: 500}
+	})
+	elsewhere := boundEntry()
+	elsewhere.ReceiverAddress = "192.0.2.7"
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{boundDeviceID: elsewhere})
+	run := runCLI(t, receiver, credFile, "", "")
+	if !strings.Contains(run.output, "warning: no -device-id") {
+		t.Fatalf("no warning that the device is taken at its word:\n%s", run.output)
+	}
+	if countPath(receiver.seen(), "/pair-setup") == 0 {
+		t.Fatalf("did not pair with the device at -target as before:\n%s", run.output)
+	}
+}
+
+// -pair is the user pairing deliberately with whatever is at the address now:
+// the binding does not refuse it, and the new pairing takes the address over.
+func TestPairTakesABoundAddressOver(t *testing.T) {
+	const newID = "11:22:33:44:55:66"
+	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
+		ListenAddress: "127.0.0.1:0",
+		Profile:       airplay.ReceiverProfileModern,
+		Auth:          airplay.ReceiverAuthPIN,
+		Code:          "4827",
+		DeviceID:      newID,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = server.Close()
+		<-served
+	})
+	port := server.Addr().(*net.TCPAddr).Port
+	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{boundDeviceID: boundEntry()})
+	load := func() *airplay.CredentialStore {
+		store, err := airplay.NewCredentialStore(credFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+
+	// Without -pair the new receiver is refused: it is not the one paired here.
+	output := startCLIUntil(t, port, credFile, "", "4827\n", func() bool { return false })
+	if !strings.Contains(output, "refusing to cast") {
+		t.Fatalf("the receiver now at the bound address was not refused:\n%s", output)
+	}
+
+	paired := func() bool { return load().Lookup(newID).HasReceiverIdentity() }
+	output = startCLIUntil(t, port, credFile, "", "4827\n", paired, "-pair")
+	if !paired() {
+		t.Fatalf("-pair did not pair with the receiver at the address:\n%s", output)
+	}
+	store := load()
+	if got := store.Lookup(newID).ReceiverAddress; got != "127.0.0.1" {
+		t.Fatalf("new pairing's receiver_address = %q, want 127.0.0.1", got)
+	}
+	if got := store.Lookup(boundDeviceID); got.ReceiverAddress != "" || !got.HasReceiverIdentity() {
+		t.Fatalf("old receiver after the address was taken over = %+v, want its pairing without the address", got)
+	}
+	if bound, _, _ := store.ReceiverAtAddress("127.0.0.1"); bound != newID {
+		t.Fatalf("receiver at the address = %q, want %q", bound, newID)
+	}
+}
+
+// Two entries at one address, as castr's copying between mode files can
+// leave: the newest pairing is the receiver meant.
+func TestNewestPairingAtAnAddressIsTheReceiverMeant(t *testing.T) {
+	receiver := startScriptedReceiver(t, func(request scriptedRequest) scriptedResponse {
+		if request.path == "/info" {
+			return infoResponse(t, "11:22:33:44:55:66", modernTestFeatures, 0)
+		}
+		return scriptedResponse{status: 500}
+	})
+	stale := boundEntry()
+	stale.PairedAt = "2026-09-01T10:00:00Z"
+	t.Run("newest names another receiver", func(t *testing.T) {
+		credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
+			boundDeviceID: boundEntry(), "11:22:33:44:55:66": stale,
+		})
+		run := runCLI(t, receiver, credFile, "", "")
+		if !strings.Contains(run.output, "if a different receiver now has that address") {
+			t.Fatalf("the newest pairing at the address was not the receiver meant:\n%s", run.output)
+		}
+	})
+	t.Run("tie", func(t *testing.T) {
+		tie := boundEntry()
+		credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{
+			boundDeviceID: boundEntry(), "11:22:33:44:55:01": tie,
+		})
+		run := runCLI(t, receiver, credFile, "", "")
+		if !strings.Contains(run.output, boundDeviceID) || !strings.Contains(run.output, "11:22:33:44:55:01") ||
+			!strings.Contains(run.output, "warning: no -device-id") {
+			t.Fatalf("a tie did not warn, naming both, and fall back to no binding:\n%s", run.output)
+		}
+	})
 }
