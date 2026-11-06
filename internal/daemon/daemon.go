@@ -1118,7 +1118,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	paired := false
 	// Once this machine has paired with a receiver, nothing falls back to
 	// transient pairing for it; airplay.AfterSavedPairing says why.
-	mustPairWithCode, mustPairRaw := false, false
+	mustPairWithCode, mustPairRaw, pairedRaw := false, false, false
 	if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		var verifyErr error
 		step := airplay.AfterSavedPairing(savedCreds, func() error {
@@ -1221,15 +1221,18 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 				return
 			}
 		} else if mustPairRaw {
-			// A raw pairing made before receiver identities: raw again, with
-			// no code and no fallback; airplay.PairAgainRaw says why. Not
-			// saved over the old entry: raw receivers need not remember a
-			// raw pairing, and one that no longer verifies is refused for
-			// good, while the old entry keeps the code held back.
+			// A raw pairing made before receiver identities: as at a first
+			// contact, but raw only, with no code and no fallback;
+			// airplay.PairAgainRaw says why. The new pairing replaces the old
+			// entry with the key the receiver gave, so later connects
+			// pair-verify against it, and the code is then released for the
+			// receiver's Digest as at a first contact.
 			if err := client.PairAgainRaw(ctx); err != nil {
 				removeStream(fmt.Sprintf("%v; refusing to cast", err))
 				return
 			}
+			savePairing(airplay.PairingCodeNone)
+			pairedRaw = true
 		} else {
 			switch requiredPairingCredentialKind(info) {
 			case CredentialKindPassword:
@@ -1268,11 +1271,10 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		}
 	}
 
-	// Installed once the receiver has proven itself, or when none was held
-	// for it. A raw pairing proves nothing, so a raw receiver paired with
-	// again keeps the password back until it verifies against the key it
-	// gave, next time.
-	if proven || !holdPassword {
+	// Installed once the receiver has proven itself, when none was held for
+	// it, or after a raw receiver was paired with again as at a first
+	// contact.
+	if proven || !holdPassword || pairedRaw {
 		holdPassword = false
 		client.SetPassword(credential)
 	}

@@ -223,7 +223,10 @@ func daemonWithEntries(t *testing.T, entries map[string]*airplay.SavedCredential
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d, err := New(Config{CredBackend: "file", CredFile: path, NoAudio: true, Code: "preset-code"})
+	// Synthetic capture: a test that gets past pairing must never start a
+	// real screen capture.
+	d, err := New(Config{CredBackend: "file", CredFile: path, NoAudio: true, Code: "preset-code",
+		TestMode: true, HWAccel: "openh264", FPS: 10, Bitrate: 500})
 	if err != nil {
 		t.Fatalf("create daemon: %v", err)
 	}
@@ -552,31 +555,26 @@ func TestDaemonPairsARawPairingBeforeIdentitiesAgainOnlyRaw(t *testing.T) {
 	device.requireNoAuthorization(t)
 }
 
-// The real raw receiver is paired with again, raw, and the session goes on.
-// The old entry is kept as it was.
-func TestDaemonRawPairingBeforeIdentitiesPairsAgainRaw(t *testing.T) {
+// The real raw receiver is paired with again, raw, as at a first contact,
+// and the new pairing replaces the old entry with the key it recorded.
+func TestDaemonRawPairingBeforeIdentitiesIsSavedWithTheReceiversKey(t *testing.T) {
 	server := startDaemonTestReceiver(t, airplay.ReceiverConfig{Profile: airplay.ReceiverProfileAppleTV3})
 	entry := savedPairingEntry(airplay.PairingCodeNone, false)
 	entry.PairingProtocol = airplay.PairingProtocolRaw
+	entry.PairedAt = ""
 	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
 	addr := server.Addr().(*net.TCPAddr)
 	if response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
 		DeviceID: savedPairingDeviceID}); !response.OK {
 		t.Fatalf("connect rejected: %+v", response)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for server.Stats().FairPlayRequests == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	saved := waitForSaved(t, d, func(entry *airplay.SavedCredentials) bool { return entry.HasReceiverIdentity() })
+	if !saved.UsesRawPairing() || saved.PairingCode != airplay.PairingCodeNone || saved.PairedAt == "" ||
+		saved.ReceiverAddress != addr.IP.String() {
+		t.Fatalf("saved %+v, want a raw pairing with the receiver's key, a time and the address", saved)
 	}
-	if stats := server.Stats(); stats.FairPlayRequests == 0 || stats.PairSetup != 1 || stats.PINStarts != 0 {
-		t.Fatalf("receiver stats %+v, want one raw pair-setup and the session going on; %+v", stats, d.handleStatus())
-	}
-	store, err := airplay.NewCredentialStore(d.cfg.CredFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if saved := store.Lookup(savedPairingDeviceID); !saved.UsesRawPairing() || saved.HasReceiverIdentity() {
-		t.Fatalf("the saved raw pairing changed: %+v", saved)
+	if stats := server.Stats(); stats.PairSetup != 1 || stats.PINStarts != 0 {
+		t.Fatalf("receiver stats %+v, want one raw pair-setup", stats)
 	}
 }
 
@@ -662,7 +660,8 @@ func TestDaemonBindsAProvenReceiverToItsAddress(t *testing.T) {
 		Auth: airplay.ReceiverAuthPIN, Code: "4827"})
 	addr := server.Addr().(*net.TCPAddr)
 	credFile := filepath.Join(t.TempDir(), "credentials.json")
-	first, err := New(Config{CredBackend: "file", CredFile: credFile, NoAudio: true})
+	first, err := New(Config{CredBackend: "file", CredFile: credFile, NoAudio: true,
+		TestMode: true, HWAccel: "openh264", FPS: 10, Bitrate: 500})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +689,8 @@ func TestDaemonBindsAProvenReceiverToItsAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := New(Config{CredBackend: "file", CredFile: credFile, NoAudio: true})
+	second, err := New(Config{CredBackend: "file", CredFile: credFile, NoAudio: true,
+		TestMode: true, HWAccel: "openh264", FPS: 10, Bitrate: 500})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,23 +785,40 @@ func TestDaemonSendsNoDigestBeforeATiedAddressSaysWhoAnswers(t *testing.T) {
 	device.requireNoAuthorization(t)
 }
 
-// A raw pairing proves nothing, so a raw receiver paired with again does not
-// get the preset code for its Digest: only a receiver that has proven itself
-// does.
-func TestDaemonRawRepairDoesNotReleaseThePresetCode(t *testing.T) {
+// A raw receiver paired with again gets the preset code for its Digest, as at
+// a first contact.
+func TestDaemonRawRepairReleasesThePresetCodeLikeAFirstContact(t *testing.T) {
+	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+		t.Skip("gst-launch-1.0 is required to start streaming")
+	}
+	if err := exec.Command("gst-inspect-1.0", "openh264enc").Run(); err != nil {
+		t.Skip("GStreamer openh264enc is required to start streaming")
+	}
 	server := startDaemonTestReceiver(t, airplay.ReceiverConfig{Profile: airplay.ReceiverProfileAppleTV3,
 		Auth: airplay.ReceiverAuthDigest, Code: "preset-code", HidePasswordStatus: true})
 	entry := savedPairingEntry(airplay.PairingCodeNone, false)
 	entry.PairingProtocol = airplay.PairingProtocolRaw
-	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	data, err := json.Marshal(map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := New(Config{CredBackend: "file", CredFile: path, NoAudio: true, Code: "preset-code",
+		TestMode: true, HWAccel: "openh264", FPS: 10, Bitrate: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Shutdown)
 	addr := server.Addr().(*net.TCPAddr)
 	if response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
 		DeviceID: savedPairingDeviceID}); !response.OK {
 		t.Fatalf("connect rejected: %+v", response)
 	}
-	failure := waitForSavedPairingError(t, d)
-	stats := server.Stats()
-	if stats.PairSetup != 1 || stats.DigestChallenges == 0 || !strings.Contains(failure, "requires a code or password") {
-		t.Fatalf("failure = %q (%+v), want a raw pairing and then a stop at the Digest challenge", failure, stats)
+	pinFlowWaitForState(t, d, StateStreaming)
+	if stats := server.Stats(); stats.PairSetup != 1 || stats.DigestChallenges == 0 {
+		t.Fatalf("receiver stats %+v, want one raw pair-setup and a Digest answered", stats)
 	}
 }

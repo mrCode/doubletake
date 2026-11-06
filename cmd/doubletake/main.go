@@ -398,16 +398,18 @@ func main() {
 		savePairingCredentials(kind)
 	}
 	// pairAgainRaw pairs again with a receiver whose saved pairing is a raw
-	// one made before receiver identities: raw, with no code and no
-	// fallback; airplay.PairAgainRaw says why. The pairing is not saved over
-	// the old one, as it was not before: raw receivers need not remember a
-	// raw pairing, and a saved one that no longer verifies is refused for
-	// good, while the old entry keeps marking this receiver as one paired
-	// with, so the code stays held back from it.
+	// one made before receiver identities: as at a first contact, but raw
+	// only, with no code and no fallback; airplay.PairAgainRaw says why. The
+	// new pairing replaces the old entry with the key the receiver gave, so
+	// later runs pair-verify against it, and the code is then released for
+	// the receiver's Digest as at a first contact.
+	pairedRaw := false
 	pairAgainRaw := func() {
 		if err := client.PairAgainRaw(ctx); err != nil {
 			log.Fatalf("%v; refusing to cast", err)
 		}
+		savePairingCredentials(airplay.PairingCodeNone)
+		pairedRaw = true
 	}
 	if needFullPair && pairedWithCode {
 		pairAgainWithCode(true)
@@ -477,10 +479,9 @@ func main() {
 		pairFresh()
 	}
 	// Installed once the receiver has proven itself, when none was held for
-	// it, or when -pair asked to pair with whatever is at the address. A raw
-	// pairing proves nothing, so a raw receiver paired with again keeps the
-	// password back until it verifies against the key it gave, next time.
-	if proven || !holdPassword || needFullPair {
+	// it, when -pair asked to pair with whatever is at the address, or after
+	// a raw receiver was paired with again as at a first contact.
+	if proven || !holdPassword || needFullPair || pairedRaw {
 		holdPassword = false
 		installPassword()
 	}

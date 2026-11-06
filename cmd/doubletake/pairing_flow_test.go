@@ -248,7 +248,8 @@ type cliRun struct {
 // preset code in DOUBLETAKE_CODE and stdin as what the user types.
 func runCLI(t *testing.T, receiver *scriptedReceiver, credFile, code, stdin string, args ...string) cliRun {
 	t.Helper()
-	all := append([]string{"-target", "127.0.0.1", "-port", receiver.port(), "-creds", credFile, "-no-audio"}, args...)
+	// -test: a run that gets past pairing must never start a real capture.
+	all := append([]string{"-target", "127.0.0.1", "-port", receiver.port(), "-creds", credFile, "-no-audio", "-test"}, args...)
 	encoded, err := json.Marshal(all)
 	if err != nil {
 		t.Fatal(err)
@@ -930,9 +931,10 @@ func TestRawPairingBeforeIdentitiesIsPairedAgainOnlyRaw(t *testing.T) {
 	}
 }
 
-// The real raw receiver is paired with again, raw, and the session goes on.
-// The old entry is kept as it was.
-func TestRawPairingBeforeIdentitiesPairsAgainRaw(t *testing.T) {
+// The real raw receiver is paired with again, raw, as at a first contact,
+// and the new pairing replaces the old entry with the key it recorded, so
+// later runs verify against it.
+func TestRawPairingBeforeIdentitiesIsSavedWithTheReceiversKey(t *testing.T) {
 	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
 		ListenAddress: "127.0.0.1:0",
 		Profile:       airplay.ReceiverProfileAppleTV3,
@@ -951,21 +953,36 @@ func TestRawPairingBeforeIdentitiesPairsAgainRaw(t *testing.T) {
 		<-served
 	})
 	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{testReceiverDeviceID: rawEntryBeforeIdentities()})
-	pastPairing := func() bool { return server.Stats().FairPlayRequests > 0 }
-	output := startCLIUntil(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "", pastPairing,
-		"-device-id", testReceiverDeviceID)
-	if !pastPairing() {
-		t.Fatalf("the raw receiver was not paired with again:\n%s", output)
+	saved := func() *airplay.SavedCredentials {
+		store, err := airplay.NewCredentialStore(credFile)
+		if err != nil {
+			return nil
+		}
+		return store.Lookup(testReceiverDeviceID)
+	}
+	output := startCLIUntil(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "",
+		func() bool { return saved().HasReceiverIdentity() }, "-device-id", testReceiverDeviceID)
+	entry := saved()
+	if !entry.HasReceiverIdentity() || !entry.UsesRawPairing() {
+		t.Fatalf("saved %+v, want a raw pairing with the receiver's key:\n%s", entry, output)
+	}
+	if entry.PairingCode != airplay.PairingCodeNone || entry.PairedAt == "" || entry.ReceiverAddress != "127.0.0.1" {
+		t.Fatalf("saved pairing_code %q paired_at %q receiver_address %q, want none, a time and 127.0.0.1",
+			entry.PairingCode, entry.PairedAt, entry.ReceiverAddress)
 	}
 	if stats := server.Stats(); stats.PairSetup != 1 || stats.PINStarts != 0 {
 		t.Fatalf("pairing requests %+v, want one raw pair-setup", stats)
 	}
-	store, err := airplay.NewCredentialStore(credFile)
-	if err != nil {
-		t.Fatal(err)
+
+	// The test receiver keeps no raw pairing past its connection, as a
+	// replaced device would not: the next run is checked against the saved
+	// key, fails, and is refused rather than paired with again.
+	run := runScriptlessCLI(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "-device-id", testReceiverDeviceID)
+	if run.err == nil || !strings.Contains(run.output, "refusing to replace the saved pairing") {
+		t.Fatalf("a raw receiver that no longer verifies was not refused:\n%s", run.output)
 	}
-	if entry := store.Lookup(testReceiverDeviceID); !entry.UsesRawPairing() || entry.HasReceiverIdentity() {
-		t.Fatalf("the saved raw pairing changed: %+v", entry)
+	if server.Stats().PairSetup != 1 {
+		t.Fatal("a raw receiver that no longer verifies was paired with again")
 	}
 }
 
@@ -1071,10 +1088,15 @@ func TestUnprovenReceiverIsNotBoundToItsAddress(t *testing.T) {
 	}
 }
 
-// A raw pairing proves nothing, so a raw receiver paired with again does not
-// get the preset code for its Digest: only a receiver that has proven itself
-// does.
-func TestRawRepairDoesNotReleaseThePresetCode(t *testing.T) {
+// A raw receiver paired with again gets the preset code for its Digest, as at
+// a first contact; before, it failed at the first challenge on every run.
+func TestRawRepairReleasesThePresetCodeLikeAFirstContact(t *testing.T) {
+	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+		t.Skip("gst-launch-1.0 is required to reach RECORD")
+	}
+	if err := exec.Command("gst-inspect-1.0", "openh264enc").Run(); err != nil {
+		t.Skip("GStreamer openh264enc is required to reach RECORD")
+	}
 	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
 		ListenAddress: "127.0.0.1:0",
 		Profile:       airplay.ReceiverProfileAppleTV3,
@@ -1097,13 +1119,14 @@ func TestRawRepairDoesNotReleaseThePresetCode(t *testing.T) {
 		<-served
 	})
 	credFile := writeCredentials(t, map[string]*airplay.SavedCredentials{testReceiverDeviceID: rawEntryBeforeIdentities()})
-	run := runScriptlessCLI(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "-device-id", testReceiverDeviceID)
-	if run.err == nil {
-		t.Fatalf("doubletake succeeded:\n%s", run.output)
+	recorded := func() bool { return server.Stats().RecordRequests > 0 }
+	output := startCLIUntil(t, server.Addr().(*net.TCPAddr).Port, credFile, presetCode, "", recorded,
+		"-device-id", testReceiverDeviceID, "-hwaccel", "openh264")
+	if !recorded() {
+		t.Fatalf("the raw receiver paired with again did not get the preset code for its Digest:\n%s", output)
 	}
-	stats := server.Stats()
-	if stats.PairSetup != 1 || stats.DigestChallenges == 0 || !strings.Contains(run.output, "requires a code or password") {
-		t.Fatalf("the run did not pair raw and then stop at the Digest challenge (%+v):\n%s", stats, run.output)
+	if stats := server.Stats(); stats.PairSetup != 1 || stats.DigestChallenges == 0 {
+		t.Fatalf("receiver stats %+v, want one raw pair-setup and a Digest answered", stats)
 	}
 }
 
