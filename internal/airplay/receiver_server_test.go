@@ -27,9 +27,13 @@ func TestReceiverServerEndToEndProfiles(t *testing.T) {
 		wantFairPlay  uint64
 		wantTiming    uint64
 		wantEvents    uint64
+		// noEncrypt: a raw Roku session has neither an encrypted control
+		// channel nor a FairPlay key, so its video key could only be sent in
+		// the clear, which is refused unless encryption is explicitly off.
+		noEncrypt bool
 	}{
 		{name: "modern Apple HAP accepts control-first PTP", profile: ReceiverProfileModern, wantEncrypted: true, wantSetups: 3, wantFairPlay: 2, wantEvents: 1},
-		{name: "Roku raw negotiates media-first receiver-initiated NTP", profile: ReceiverProfileRoku, wantSetups: 3, wantTiming: 3, wantEvents: 1},
+		{name: "Roku raw negotiates media-first receiver-initiated NTP", profile: ReceiverProfileRoku, wantSetups: 3, wantTiming: 3, wantEvents: 1, noEncrypt: true},
 		{name: "LG HAP negotiates media-first PTP", profile: ReceiverProfileLG, wantEncrypted: true, wantSetups: 3, wantEvents: 1},
 		{name: "AppleTV3 raw negotiates media-first receiver-initiated NTP", profile: ReceiverProfileAppleTV3, wantSetups: 3, wantFairPlay: 2, wantTiming: 3, wantEvents: 1},
 		{name: "UxPlay legacy accepts control-first without eventPort", profile: ReceiverProfileUxPlay, wantSetups: 3, wantFairPlay: 2, wantTiming: 3},
@@ -63,7 +67,7 @@ func TestReceiverServerEndToEndProfiles(t *testing.T) {
 				}
 			}
 
-			session, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
+			session, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true, NoEncrypt: test.noEncrypt})
 			if err != nil {
 				t.Fatalf("setup mirror: %v", err)
 			}
@@ -648,6 +652,7 @@ func TestMediaFirstAutoFallsBackBeforeCreatingLatencyMismatch(t *testing.T) {
 		VideoCodec:             VideoCodecAuto,
 		AutomaticHEVCAvailable: true,
 		MeasuredVideoLatency:   150 * time.Millisecond,
+		NoEncrypt:              true, // raw Roku: no protected way to send a video key
 	}, func(_, _ int, codec VideoCodec) error {
 		if codec != VideoCodecH264 {
 			return fmt.Errorf("media-first codec = %s, want coherent H.264 fallback", codec)
@@ -679,6 +684,7 @@ func TestMediaFirstCalibratedAutoFallsBackBeforeLiveMeasurement(t *testing.T) {
 	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
 		VideoCodec:             VideoCodecAuto,
 		AutomaticHEVCAvailable: true,
+		NoEncrypt:              true, // raw Roku: no protected way to send a video key
 	}, func(_, _ int, codec VideoCodec) (VideoPreparationResult, error) {
 		preparedCodec = codec
 		if codec == VideoCodecHEVC {
@@ -710,6 +716,7 @@ func TestMediaFirstForcedHEVCRejectsLateLiveLead(t *testing.T) {
 	}
 	_, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
 		VideoCodec: VideoCodecHEVC,
+		NoEncrypt:  true, // raw Roku: no protected way to send a video key
 	}, func(_, _ int, codec VideoCodec) (VideoPreparationResult, error) {
 		if codec != VideoCodecHEVC {
 			return VideoPreparationResult{}, fmt.Errorf("prepared codec = %s, want HEVC", codec)
@@ -910,7 +917,8 @@ func TestReceiverServerHiddenDigestRequirementCanRetrySetup(t *testing.T) {
 	// SETUP is attempted. Nothing should be accepted before the caller obtains
 	// that credential, and the error must be distinguishable from other setup
 	// failures so an interactive caller can prompt once.
-	if _, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true}); !errors.Is(err, ErrCredentialsRequired) {
+	// Raw Roku: no protected way to send a video key, so encryption is off.
+	if _, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true, NoEncrypt: true}); !errors.Is(err, ErrCredentialsRequired) {
 		t.Fatalf("first setup error = %v, want ErrCredentialsRequired", err)
 	}
 	stats := server.Stats()
@@ -922,7 +930,7 @@ func TestReceiverServerHiddenDigestRequirementCanRetrySetup(t *testing.T) {
 	// starts a fresh negotiation, whose absolute RTSP URI differs from the
 	// challenged attempt; the client must recompute the Digest for that URI.
 	client.SetPassword(code)
-	session, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
+	session, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true, NoEncrypt: true})
 	if err != nil {
 		t.Fatalf("retry setup with password: %v", err)
 	}
@@ -1080,7 +1088,8 @@ func TestReceiverServerPINAndDigestModes(t *testing.T) {
 		if client.encrypted {
 			t.Fatal("raw Roku pairing unexpectedly encrypted the control channel")
 		}
-		session, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
+		// Raw Roku: no protected way to send a video key, so encryption is off.
+		session, err := client.SetupMirror(ctx, StreamConfig{NoAudio: true, NoEncrypt: true})
 		if err != nil {
 			t.Fatalf("Digest-protected setup: %v", err)
 		}

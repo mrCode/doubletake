@@ -269,6 +269,9 @@ func testDaemonCaptureGroupOrder(t *testing.T, firstSize, secondSize [2]int) {
 		HWAccel:     "openh264",
 		TestMode:    true,
 		NoAudio:     true,
+		// These raw Roku receivers have neither an encrypted control channel
+		// nor a FairPlay key, so a video key could only be sent in the clear.
+		NoEncrypt: true,
 	})
 	if err != nil {
 		t.Fatalf("create daemon: %v", err)

@@ -294,11 +294,11 @@ func TestSetupMirrorDigestRetryReusesStartedVideoPreparation(t *testing.T) {
 		return nil
 	}
 
-	if _, err := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, prepareVideo); !errors.Is(err, ErrCredentialsRequired) {
+	if _, err := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true, NoEncrypt: true}, prepareVideo); !errors.Is(err, ErrCredentialsRequired) {
 		t.Fatalf("first setup error = %v, want ErrCredentialsRequired", err)
 	}
 	client.SetPassword("configured password")
-	if _, err := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, prepareVideo); err == nil {
+	if _, err := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true, NoEncrypt: true}, prepareVideo); err == nil {
 		t.Fatal("second setup unexpectedly completed past the scripted stop")
 	} else {
 		var statusErr *HTTPStatusError
@@ -394,7 +394,7 @@ func TestSetupMirrorTearsDownAcceptedControlWhenVideoPreparationFails(t *testing
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	prepareErr := errors.New("production capture did not start")
-	_, setupErr := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, func(int, int) error {
+	_, setupErr := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true, NoEncrypt: true}, func(int, int) error {
 		return prepareErr
 	})
 	if !errors.Is(setupErr, prepareErr) {
@@ -469,7 +469,7 @@ func TestSetupMirrorTearsDownAcceptedLegacyAudioOnResponseFailure(t *testing.T) 
 	defer client.Close()
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
-	_, setupErr := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
+	_, setupErr := client.SetupMirror(ctx, StreamConfig{NoAudio: true, NoEncrypt: true})
 	if setupErr == nil || !strings.Contains(setupErr.Error(), "unmarshal audio stream SETUP response") {
 		t.Fatalf("setup error = %v, want malformed accepted audio response", setupErr)
 	}
@@ -527,7 +527,7 @@ func TestSetupMirrorDoesNotTeardownRejectedControl(t *testing.T) {
 	}
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
-	_, setupErr := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
+	_, setupErr := client.SetupMirror(ctx, StreamConfig{NoAudio: true, NoEncrypt: true})
 	var statusErr *HTTPStatusError
 	if !errors.As(setupErr, &statusErr) || statusErr.StatusCode != 500 {
 		t.Fatalf("setup error = %v, want original HTTP 500", setupErr)
@@ -606,7 +606,7 @@ func TestSetupMirrorClosesTimedOutSequentialConnectionWithoutTeardown(t *testing
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	prepareCalls := 0
-	_, setupErr := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, func(int, int) error {
+	_, setupErr := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true, NoEncrypt: true}, func(int, int) error {
 		prepareCalls++
 		return nil
 	})
@@ -747,7 +747,7 @@ func testMirrorSessionInfoFailure(t *testing.T, infoResponse []byte, wantTeardow
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	prepareCalls := 0
-	_, setupErr := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, func(int, int) error {
+	_, setupErr := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true, NoEncrypt: true}, func(int, int) error {
 		prepareCalls++
 		return nil
 	})
@@ -1390,7 +1390,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 	}
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: screenStreamFormats}}
 
-	session, err := client.SetupMirror(ctx, StreamConfig{FPS: 30, NoAudio: noAudio})
+	session, err := client.SetupMirror(ctx, StreamConfig{FPS: 30, NoAudio: noAudio, NoEncrypt: true})
 	if err != nil {
 		t.Fatalf("SetupMirror(noAudio=%v): %v", noAudio, err)
 	}

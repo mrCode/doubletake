@@ -241,6 +241,11 @@ type MirrorSession struct {
 	noAudio     bool
 }
 
+// ErrStreamKeyUnprotected means the video key could only reach the receiver
+// in the clear: the control channel is not encrypted, and there is no FairPlay
+// key for the receiver to derive it from.
+var ErrStreamKeyUnprotected = errors.New("no protected way to give the receiver the video key")
+
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
 	if encrypted {
 		return audioSecurityChaCha
@@ -498,6 +503,14 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// Determine stream encryption key
 	encKey := c.fpKey
 	encIV := c.fpIV
+	if encKey == nil && !c.encrypted && !cfg.NoEncrypt {
+		// The key would be c.streamKey, which the receiver can learn only from
+		// shk, and on a plaintext control channel shk is readable by anyone on
+		// the network path. Refuse before any SETUP rather than send it.
+		return nil, fmt.Errorf("%w: the control channel is not encrypted and the receiver "+
+			"offered no FairPlay key; run with -no-encrypt to cast to it without video encryption",
+			ErrStreamKeyUnprotected)
+	}
 	if encKey == nil {
 		if c.streamKey == nil {
 			if err := c.deriveStreamKeys(); err != nil {
@@ -1044,9 +1057,17 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		},
 	}
 
-	// Encryption keys: shk/shiv go inside the video stream descriptor
+	// Encryption keys: shk/shiv go inside the video stream descriptor. shk only
+	// on an encrypted control channel: in the clear, it and the
+	// streamConnectionID beside it are all anyone on the network path needs to
+	// derive the video key. Legacy receivers on a plaintext channel derive it
+	// from the FairPlay ekey sent at the session root instead (mixed with the
+	// pair-verify secret when MixFairPlayKey is set), as audio already does.
+	// shiv equals the eiv sent there, so it reveals nothing new.
 	if encKey != nil {
-		videoStreamDesc["shk"] = encKey
+		if c.encrypted {
+			videoStreamDesc["shk"] = encKey
+		}
 		videoStreamDesc["shiv"] = encIV
 	}
 
