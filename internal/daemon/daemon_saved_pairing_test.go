@@ -555,26 +555,43 @@ func TestDaemonPairsARawPairingBeforeIdentitiesAgainOnlyRaw(t *testing.T) {
 	device.requireNoAuthorization(t)
 }
 
-// The real raw receiver is paired with again, raw, as at a first contact,
-// and the new pairing replaces the old entry with the key it recorded.
-func TestDaemonRawPairingBeforeIdentitiesIsSavedWithTheReceiversKey(t *testing.T) {
+// Raw receivers keep no pairing across connections, so a raw entry saved
+// before identities cannot be pinned: every connect pairs with the receiver
+// again, raw, as at a first contact, and the entry is left as it was.
+func TestDaemonRawPairingBeforeIdentitiesIsPairedAgainRawEachConnect(t *testing.T) {
 	server := startDaemonTestReceiver(t, airplay.ReceiverConfig{Profile: airplay.ReceiverProfileAppleTV3})
 	entry := savedPairingEntry(airplay.PairingCodeNone, false)
 	entry.PairingProtocol = airplay.PairingProtocolRaw
 	entry.PairedAt = ""
 	d := daemonWithEntries(t, map[string]*airplay.SavedCredentials{savedPairingDeviceID: entry})
 	addr := server.Addr().(*net.TCPAddr)
-	if response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
-		DeviceID: savedPairingDeviceID}); !response.OK {
-		t.Fatalf("connect rejected: %+v", response)
-	}
-	saved := waitForSaved(t, d, func(entry *airplay.SavedCredentials) bool { return entry.HasReceiverIdentity() })
-	if !saved.UsesRawPairing() || saved.PairingCode != airplay.PairingCodeNone || saved.PairedAt == "" ||
-		saved.ReceiverAddress != addr.IP.String() {
-		t.Fatalf("saved %+v, want a raw pairing with the receiver's key, a time and the address", saved)
-	}
-	if stats := server.Stats(); stats.PairSetup != 1 || stats.PINStarts != 0 {
-		t.Fatalf("receiver stats %+v, want one raw pair-setup", stats)
+	for connect := 1; connect <= 2; connect++ {
+		before := server.Stats()
+		if response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port,
+			DeviceID: savedPairingDeviceID}); !response.OK {
+			t.Fatalf("connect %d rejected: %+v", connect, response)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for server.Stats().FairPlayRequests == before.FairPlayRequests && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if stats := server.Stats(); stats.FairPlayRequests == before.FairPlayRequests ||
+			stats.PairSetup != before.PairSetup+1 || stats.PINStarts != before.PINStarts {
+			t.Fatalf("connect %d: receiver stats %+v, want one more raw pair-setup and the session going on; %+v",
+				connect, stats, d.handleStatus())
+		}
+		store, err := airplay.NewCredentialStore(d.cfg.CredFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if saved := store.Lookup(savedPairingDeviceID); !saved.UsesRawPairing() || saved.HasReceiverIdentity() ||
+			saved.PairedAt != "" || saved.ReceiverAddress != "" {
+			t.Fatalf("connect %d changed the saved raw entry: %+v", connect, saved)
+		}
+		if response := d.handleDisconnect(Request{Cmd: "disconnect", Target: addr.IP.String()}); !response.OK {
+			t.Fatalf("disconnect %d rejected: %+v", connect, response)
+		}
+		pinFlowWaitForState(t, d, StateIdle)
 	}
 }
 

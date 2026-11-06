@@ -398,17 +398,18 @@ func main() {
 		savePairingCredentials(kind)
 	}
 	// pairAgainRaw pairs again with a receiver whose saved pairing is a raw
-	// one made before receiver identities: as at a first contact, but raw
-	// only, with no code and no fallback; airplay.PairAgainRaw says why. The
-	// new pairing replaces the old entry with the key the receiver gave, so
-	// later runs pair-verify against it, and the code is then released for
-	// the receiver's Digest as at a first contact.
+	// one made before receiver identities. Raw receivers keep no pairing
+	// across connections, so nothing can be pinned: each connection is
+	// trusted as at a first contact, which saves nothing, and the code is
+	// then released for the receiver's Digest as there. What a raw entry
+	// still guarantees (airplay.PairAgainRaw) is that it never leads to
+	// pairing with a code, a Digest before the raw pairing, or a transient
+	// fallback.
 	pairedRaw := false
 	pairAgainRaw := func() {
 		if err := client.PairAgainRaw(ctx); err != nil {
 			log.Fatalf("%v; refusing to cast", err)
 		}
-		savePairingCredentials(airplay.PairingCodeNone)
 		pairedRaw = true
 	}
 	if needFullPair && pairedWithCode {

@@ -1221,17 +1221,17 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 				return
 			}
 		} else if mustPairRaw {
-			// A raw pairing made before receiver identities: as at a first
-			// contact, but raw only, with no code and no fallback;
-			// airplay.PairAgainRaw says why. The new pairing replaces the old
-			// entry with the key the receiver gave, so later connects
-			// pair-verify against it, and the code is then released for the
-			// receiver's Digest as at a first contact.
+			// A raw pairing made before receiver identities. Raw receivers
+			// keep no pairing across connections, so nothing can be pinned:
+			// each connection is trusted as at a first contact, which saves
+			// nothing, and the code is then released for the receiver's
+			// Digest as there. What a raw entry still guarantees
+			// (airplay.PairAgainRaw) is that it never leads to pairing with a
+			// code, a Digest before the raw pairing, or a transient fallback.
 			if err := client.PairAgainRaw(ctx); err != nil {
 				removeStream(fmt.Sprintf("%v; refusing to cast", err))
 				return
 			}
-			savePairing(airplay.PairingCodeNone)
 			pairedRaw = true
 		} else {
 			switch requiredPairingCredentialKind(info) {

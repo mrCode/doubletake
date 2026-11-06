@@ -138,8 +138,9 @@ func (c *AirPlayClient) PairAgainWithCode(ctx context.Context, saved *SavedCrede
 
 // PairAgainRaw pairs again, with raw pair-setup and nothing else, with a
 // receiver whose saved pairing is a raw one made before receiver identities
-// were recorded (SavedPairingPairAsNew). On success ReceiverIdentity holds the
-// key the receiver gave, for SavePairing.
+// were recorded (SavedPairingPairAsNew). Raw receivers keep no pairing across
+// connections, so the result is a session, like a first contact's, and not a
+// pairing to save.
 //
 // The receiver paired with that way took no code, so whatever /info now
 // claims, none is offered: no PIN or password pair-setup with a preset code,
