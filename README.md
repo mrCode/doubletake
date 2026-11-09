@@ -282,6 +282,7 @@ doubletake-ctl disconnect
 | `-target-latency-ms` | 0 | Joint audio/video playout latency override in milliseconds (`0` = automatic wired/wireless profiles with separate audio/video defaults) |
 | `-hwaccel` | auto | Encoder preference: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
 | `-video-codec` | auto | Screen codec: compatible H.264 `auto`, forced `h264`, or forced `hevc` |
+| `-max-size` | (none) | Largest canvas to negotiate, `WIDTHxHEIGHT`; only shrinks the receiver's canvas, keeping its aspect ratio |
 | `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
 | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
 | `-no-audio` | false | Disable audio streaming |

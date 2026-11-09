@@ -94,6 +94,11 @@ Forced HEVC uses the receiver's maximum canvas and may also use VA-API
 (vah265enc) or x265.
 Main10 output does not fabricate HDR metadata for an SDR capture source.
 .TP
+.B \-max-size \fIWIDTH\fBx\fIHEIGHT\fR
+Largest video canvas to negotiate, for example \fB2560x1440\fR. The cap only
+shrinks the canvas the codec would use, keeping its aspect ratio and even
+dimensions; it never exceeds the receiver's maximum. Empty means no cap.
+.TP
 .B \-debug
 Enable verbose protocol logging
 .TP

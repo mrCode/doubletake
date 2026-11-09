@@ -101,6 +101,8 @@ type Config struct {
 	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
 	HWAccel     string
 	VideoCodec  airplay.VideoCodec
+	MaxWidth    int // cap on the negotiated video canvas; zero with MaxHeight means no cap
+	MaxHeight   int // cap on the negotiated video canvas; zero with MaxWidth means no cap
 	Debug       bool
 	TestMode    bool
 	NoEncrypt   bool
@@ -112,14 +114,16 @@ type Config struct {
 
 func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
 	return airplay.StreamConfig{
-		FPS:        d.cfg.FPS,
-		Bitrate:    d.cfg.Bitrate,
-		VideoCodec: d.cfg.VideoCodec,
-		NoEncrypt:  d.cfg.NoEncrypt,
-		DirectKey:  d.cfg.DirectKey,
-		NoAudio:    d.cfg.NoAudio,
-		PortMin:    d.cfg.PortMin,
-		PortMax:    d.cfg.PortMax,
+		FPS:            d.cfg.FPS,
+		Bitrate:        d.cfg.Bitrate,
+		VideoCodec:     d.cfg.VideoCodec,
+		MaxVideoWidth:  d.cfg.MaxWidth,
+		MaxVideoHeight: d.cfg.MaxHeight,
+		NoEncrypt:      d.cfg.NoEncrypt,
+		DirectKey:      d.cfg.DirectKey,
+		NoAudio:        d.cfg.NoAudio,
+		PortMin:        d.cfg.PortMin,
+		PortMax:        d.cfg.PortMax,
 	}
 }
 

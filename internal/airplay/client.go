@@ -1353,6 +1353,8 @@ type StreamConfig struct {
 	VideoCodec             VideoCodec    // empty/h264, auto (H.264), or explicitly requested hevc
 	AutomaticHEVCAvailable bool          // retained for programmatic compatibility
 	MeasuredVideoLatency   time.Duration // measured minimum lead for the local HEVC capture path
+	MaxVideoWidth          int           // cap on the negotiated canvas width; zero with MaxVideoHeight means no cap
+	MaxVideoHeight         int           // cap on the negotiated canvas height; zero with MaxVideoWidth means no cap
 	NoEncrypt              bool          // Disable encryption for debugging
 	DirectKey              bool          // Use shk/shiv directly without SHA-512 derivation
 	NoAudio                bool          // Disable audio streaming

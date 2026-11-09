@@ -777,7 +777,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		if videoPrepared {
 			return nil
 		}
-		selection, selectionErr := info.selectVideo(cfg.VideoCodec, cfg.AutomaticHEVCAvailable)
+		selection, selectionErr := info.selectVideo(cfg.VideoCodec, cfg.AutomaticHEVCAvailable, cfg.MaxVideoWidth, cfg.MaxVideoHeight)
 		if selectionErr != nil {
 			return selectionErr
 		}
@@ -787,7 +787,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			// latencyMax has been accepted. Keep the descriptor and TimeAnnounce
 			// coherent by retaining the nominal H.264 path for this session rather
 			// than selecting a calibrated HEVC clock too late.
-			selection, selectionErr = info.selectVideo(VideoCodecH264, false)
+			selection, selectionErr = info.selectVideo(VideoCodecH264, false, cfg.MaxVideoWidth, cfg.MaxVideoHeight)
 			if selectionErr != nil {
 				return selectionErr
 			}
@@ -818,7 +818,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		if prepareErr != nil && cfg.VideoCodec == VideoCodecAuto && selection.codec == VideoCodecHEVC &&
 			errors.Is(prepareErr, ErrAutomaticVideoCodecUnavailable) {
 			dbg("[SETUP] automatic high-resolution capture failed; retrying the nominal H.264 canvas: %v", prepareErr)
-			selection, selectionErr = info.selectVideo(VideoCodecH264, false)
+			selection, selectionErr = info.selectVideo(VideoCodecH264, false, cfg.MaxVideoWidth, cfg.MaxVideoHeight)
 			if selectionErr != nil {
 				return selectionErr
 			}

@@ -141,3 +141,27 @@ func TestRestoreSavedPairingRestoresRawProtocol(t *testing.T) {
 		t.Fatalf("restored protocol = %q, want raw", got)
 	}
 }
+
+func TestAMalformedMaxSizeIsRejected(t *testing.T) {
+	for _, value := range []string{"1920", "1920x", "x1080", "wide", "1920x1080x2", "0x1080", "1920x0", "-1920x1080", "1920X1080 extra", "1.5x2", "+1920x1080", "1920 x 1080", "99999999999999999999x1080"} {
+		if _, _, err := parseMaxSize(value); err == nil || err.Error() != "-max-size must be WIDTHxHEIGHT" {
+			t.Errorf("parseMaxSize(%q) error = %v, want -max-size must be WIDTHxHEIGHT", value, err)
+		}
+	}
+}
+
+func TestMaxSizeParsesWidthAndHeight(t *testing.T) {
+	for _, test := range []struct {
+		value         string
+		width, height int
+	}{
+		{value: ""},
+		{value: "2560x1440", width: 2560, height: 1440},
+		{value: " 1920x1080 ", width: 1920, height: 1080},
+	} {
+		width, height, err := parseMaxSize(test.value)
+		if err != nil || width != test.width || height != test.height {
+			t.Errorf("parseMaxSize(%q) = %dx%d err=%v, want %dx%d", test.value, width, height, err, test.width, test.height)
+		}
+	}
+}

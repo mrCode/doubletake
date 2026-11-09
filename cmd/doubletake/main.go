@@ -57,6 +57,36 @@ func parsePortRange(s string) (int, int, error) {
 	return lo, hi, nil
 }
 
+// errMalformedMaxSize is the startup error for a -max-size that is not two
+// positive integers joined by x.
+var errMalformedMaxSize = errors.New("-max-size must be WIDTHxHEIGHT")
+
+// parseMaxSize parses a "WIDTHxHEIGHT" canvas cap. An empty string returns
+// (0, 0, nil), meaning no cap.
+func parseMaxSize(s string) (int, int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, nil
+	}
+	widthText, heightText, _ := strings.Cut(s, "x")
+	width, widthOK := positiveDecimal(widthText)
+	height, heightOK := positiveDecimal(heightText)
+	if !widthOK || !heightOK {
+		return 0, 0, errMalformedMaxSize
+	}
+	return width, height, nil
+}
+
+// positiveDecimal accepts only ASCII digits, so signs, spaces and a second x
+// are malformed rather than quietly parsed.
+func positiveDecimal(text string) (int, bool) {
+	if text == "" || strings.Trim(text, "0123456789") != "" {
+		return 0, false
+	}
+	value, err := strconv.Atoi(text)
+	return value, err == nil && value > 0
+}
+
 func main() {
 	target := flag.String("target", "", "Apple TV IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
@@ -70,6 +100,7 @@ func main() {
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic connection profile)")
 	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
 	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses H.264 for receiver compatibility)")
+	maxSize := flag.String("max-size", "", "Largest video canvas to negotiate, WIDTHxHEIGHT (e.g. 2560x1440); it only shrinks the receiver's canvas, keeping its aspect ratio; empty = no cap")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Send video frames unencrypted (debugging, or a receiver with neither an encrypted control channel nor FairPlay, which has no protected way to receive the video key)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
@@ -88,6 +119,10 @@ func main() {
 	}
 	if err := airplay.ValidateVideoCodec(*videoCodec); err != nil {
 		log.Fatalf("invalid -video-codec: %v", err)
+	}
+	maxWidth, maxHeight, err := parseMaxSize(*maxSize)
+	if err != nil {
+		log.Fatal(err)
 	}
 	portMin, portMax, err := parsePortRange(*portRange)
 	if err != nil {
@@ -115,6 +150,8 @@ func main() {
 			PortMax:     portMax,
 			HWAccel:     *hwaccel,
 			VideoCodec:  airplay.VideoCodec(*videoCodec),
+			MaxWidth:    maxWidth,
+			MaxHeight:   maxHeight,
 			Debug:       *debug,
 			TestMode:    *testMode,
 			NoEncrypt:   *noEncrypt,
@@ -504,14 +541,16 @@ func main() {
 	}
 
 	streamCfg := airplay.StreamConfig{
-		FPS:        *fps,
-		Bitrate:    *bitrate,
-		VideoCodec: airplay.VideoCodec(*videoCodec),
-		NoEncrypt:  *noEncrypt,
-		DirectKey:  *directKey,
-		NoAudio:    *noAudio,
-		PortMin:    portMin,
-		PortMax:    portMax,
+		FPS:            *fps,
+		Bitrate:        *bitrate,
+		VideoCodec:     airplay.VideoCodec(*videoCodec),
+		MaxVideoWidth:  maxWidth,
+		MaxVideoHeight: maxHeight,
+		NoEncrypt:      *noEncrypt,
+		DirectKey:      *directKey,
+		NoAudio:        *noAudio,
+		PortMin:        portMin,
+		PortMax:        portMax,
 	}
 	// Complete the potentially interactive Wayland portal request before SETUP,
 	// but delay encoder startup until control SETUP returns session-time display

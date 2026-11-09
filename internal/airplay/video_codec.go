@@ -56,8 +56,18 @@ type videoSelection struct {
 
 // selectVideo chooses one concrete codec and canvas from the final receiver
 // snapshot. The interoperable screen sender path uses AVC at the receiver's
-// nominal canvas. HEVC remains an explicit diagnostic override.
-func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable bool) (videoSelection, error) {
+// nominal canvas. HEVC remains an explicit diagnostic override. A positive
+// maxWidth and maxHeight cap the chosen canvas; zero means no cap.
+func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable bool, maxWidth, maxHeight int) (videoSelection, error) {
+	selection, err := i.selectUncappedVideo(requested, automaticHEVCAvailable)
+	if err != nil {
+		return videoSelection{}, err
+	}
+	selection.width, selection.height = capVideoSize(selection.width, selection.height, maxWidth, maxHeight)
+	return selection, nil
+}
+
+func (i *ReceiverInfo) selectUncappedVideo(requested VideoCodec, automaticHEVCAvailable bool) (videoSelection, error) {
 	_ = automaticHEVCAvailable // Retained for programmatic compatibility.
 	if requested == "" {
 		requested = VideoCodecH264
@@ -82,6 +92,21 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 	default:
 		panic("validated video codec has no selection policy")
 	}
+}
+
+// capVideoSize shrinks a canvas to fit maxWidth x maxHeight, preserving its
+// aspect ratio. It never raises a canvas, and a canvas it shrinks stays even
+// in both dimensions because encoders need even sizes. A zero cap leaves the
+// canvas unchanged.
+func capVideoSize(width, height, maxWidth, maxHeight int) (int, int) {
+	if maxWidth <= 0 || maxHeight <= 0 || width <= 0 || height <= 0 {
+		return width, height
+	}
+	cappedW, cappedH := fitVideoSize(width, height, maxWidth, maxHeight)
+	if cappedW == width && cappedH == height {
+		return width, height
+	}
+	return max(cappedW&^1, 2), max(cappedH&^1, 2)
 }
 
 // highResolutionVideoCanvas implements the high-resolution display-size gate.

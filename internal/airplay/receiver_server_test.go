@@ -445,6 +445,32 @@ func TestSetupMirrorAutomaticallySelectsNominalH264FromSessionDisplayInfo(t *tes
 	}
 }
 
+func TestSetupMirrorPreparesTheCappedCanvas(t *testing.T) {
+	SetTargetLatency(0)
+	t.Cleanup(func() { SetTargetLatency(0) })
+	_, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{Profile: ReceiverProfileModern})
+	if err := client.Pair(ctx, ""); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	if err := client.FairPlaySetup(ctx); err != nil {
+		t.Fatalf("FairPlay setup: %v", err)
+	}
+	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, StreamConfig{
+		VideoCodec:     VideoCodecAuto,
+		MaxVideoWidth:  1280,
+		MaxVideoHeight: 720,
+	}, func(width, height int, codec VideoCodec) error {
+		if codec != VideoCodecH264 || width != 1280 || height != 720 {
+			return fmt.Errorf("capped selection = %s %dx%d, want H.264 1280x720", codec, width, height)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("setup mirror: %v", err)
+	}
+	session.Close()
+}
+
 func TestAutomaticVideoPreparationStartsNominalH264(t *testing.T) {
 	SetTargetLatency(0)
 	t.Cleanup(func() { SetTargetLatency(0) })
