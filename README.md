@@ -283,6 +283,7 @@ doubletake-ctl disconnect
 | `-hwaccel` | auto | Encoder preference: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
 | `-video-codec` | auto | Screen codec: compatible H.264 `auto`, forced `h264`, or forced `hevc` |
 | `-max-size` | (none) | Largest canvas to negotiate, `WIDTHxHEIGHT`; only shrinks the receiver's canvas, keeping its aspect ratio |
+| `-print-canvas` | false | Print `canvas WIDTHxHEIGHT`, the canvas the `-target` receiver would get under `-video-codec` and `-max-size`, and exit; one GET /info, no pairing or capture. Prints `canvas unknown: REASON` and exits 1 when it cannot tell |
 | `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
 | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
 | `-no-audio` | false | Disable audio streaming |

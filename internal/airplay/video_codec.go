@@ -67,6 +67,17 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 	return selection, nil
 }
 
+// SelectedVideoCanvas returns the canvas a mirroring session would negotiate
+// from this receiver snapshot for the requested codec, under a maxWidth x
+// maxHeight cap (zero means no cap).
+func (i *ReceiverInfo) SelectedVideoCanvas(requested VideoCodec, maxWidth, maxHeight int) (int, int, error) {
+	selection, err := i.selectVideo(requested, false, maxWidth, maxHeight)
+	if err != nil {
+		return 0, 0, err
+	}
+	return selection.width, selection.height, nil
+}
+
 func (i *ReceiverInfo) selectUncappedVideo(requested VideoCodec, automaticHEVCAvailable bool) (videoSelection, error) {
 	_ = automaticHEVCAvailable // Retained for programmatic compatibility.
 	if requested == "" {
