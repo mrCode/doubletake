@@ -19,7 +19,7 @@ SRP-6a pairing with PIN and persistent credential storage
 .IP \(bu 2
 H.264 encoding with NVENC, VA-API, OpenH264, and x264
 .IP \(bu 2
-Capability-gated HEVC Main10/high-resolution encoding with NVENC or x265
+Capability-gated HEVC Main10/high-resolution encoding with NVENC, VA-API or x265
 .IP \(bu 2
 ChaCha20-Poly1305 stream encryption
 .IP \(bu 2
@@ -90,7 +90,8 @@ required GStreamer encoder is unavailable. The default is \fBauto\fR.
 .B \-video-codec \fICODEC\fR
 Screen codec: compatible H.264 \fBauto\fR (default), forced \fBh264\fR, or
 forced \fBhevc\fR. Automatic mode uses H.264 at the receiver's nominal canvas.
-Forced HEVC uses the receiver's maximum canvas and may also use x265.
+Forced HEVC uses the receiver's maximum canvas and may also use VA-API
+(vah265enc) or x265.
 Main10 output does not fabricate HDR metadata for an SDR capture source.
 .TP
 .B \-debug

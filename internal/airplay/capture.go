@@ -1059,7 +1059,7 @@ func waylandCapturePlans(encoder encoderResult, hasElement func(string) bool) []
 		// cannot import the portal's DMA-BUF or map its new output.
 		plans = append(plans, waylandCapturePlan{encoder: encoder, mode: waylandPipelineVAPostprocPlainRaw})
 	}
-	// vah264enc accepts both VAMemory and ordinary NV12. A failed VA import
+	// vah264enc and vah265enc accept both VAMemory and ordinary NV12. A failed VA import
 	// can therefore fall back to a CPU-owned frame without changing the selected
 	// encoder backend. Every other encoder has only its normal system-memory plan.
 	plans = append(plans, waylandCapturePlan{encoder: encoder, mode: waylandPipelineSystemMemory})
@@ -2115,6 +2115,16 @@ func selectGstHEVCEncoder(cfg CaptureConfig, hasElement func(string) bool, annou
 			}},
 		},
 		{
+			// Like vah264enc, vah265enc accepts both VAMemory and ordinary NV12,
+			// so the portal's VA path and the system-memory fallback both apply.
+			// target-usage=7 is the fastest preset, as screen mirroring needs.
+			method: "vaapi", element: "vah265enc", label: "VA-API HEVC Main hardware encoding (vah265enc)",
+			result: encoderResult{codec: VideoCodecHEVC, rawFormat: "NV12", inputMemory: encoderInputVAMemory, parts: gstStage{
+				"vah265enc", fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("key-int-max=%d", keyframeInterval),
+				"b-frames=0", "rate-control=cbr", "target-usage=7",
+			}},
+		},
+		{
 			method: "none", element: "x265enc", label: "x265 HEVC Main software encoding (x265enc)",
 			result: encoderResult{codec: VideoCodecHEVC, rawFormat: "I420", parts: gstStage{
 				"x265enc", fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("key-int-max=%d", keyframeInterval),
@@ -2134,9 +2144,9 @@ func selectGstHEVCEncoder(cfg CaptureConfig, hasElement func(string) bool, annou
 		}
 	}
 	if hwaccel == "auto" {
-		return encoderResult{}, fmt.Errorf("HEVC requires GStreamer nvh265enc or x265enc; neither is available")
+		return encoderResult{}, fmt.Errorf("HEVC requires GStreamer nvh265enc, vah265enc or x265enc; none is available")
 	}
-	return encoderResult{}, fmt.Errorf("-video-codec hevc is unavailable with -hwaccel %s (use nvenc or none)", hwaccel)
+	return encoderResult{}, fmt.Errorf("-video-codec hevc is unavailable with -hwaccel %s (use nvenc, vaapi or none)", hwaccel)
 }
 
 // StartTestCapture creates a synthetic stream with the configured encoder.

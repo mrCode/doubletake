@@ -575,6 +575,83 @@ func TestSelectGstHEVCEncoderUsesMainProfileInput(t *testing.T) {
 	}
 }
 
+func TestVAAPIHEVCIsAnExplicitHEVCCandidate(t *testing.T) {
+	onlyVA := func(name string) bool { return name == "vah265enc" }
+	for _, hwaccel := range []string{"auto", "vaapi"} {
+		t.Run(hwaccel, func(t *testing.T) {
+			encoder, err := selectGstEncoderWithProbe(CaptureConfig{
+				VideoCodec: VideoCodecHEVC,
+				HWAccel:    hwaccel,
+				FPS:        30,
+				Bitrate:    4_000,
+			}, onlyVA, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoder.codec != VideoCodecHEVC || encoder.rawFormat != "NV12" || encoder.parts[0] != "vah265enc" {
+				t.Fatalf("encoder = codec %q format %q parts %q, want HEVC NV12 vah265enc", encoder.codec, encoder.rawFormat, encoder.parts)
+			}
+			joined := strings.Join(encoder.parts, " ")
+			for _, want := range []string{"bitrate=4000", "key-int-max=", "rate-control=cbr", "target-usage=7"} {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("vah265enc parts %q do not contain %q", joined, want)
+				}
+			}
+		})
+	}
+}
+
+func TestVAAPIHEVCComesAfterNVENCAndBeforeX265(t *testing.T) {
+	all := func(name string) bool { return name == "nvh265enc" || name == "vah265enc" || name == "x265enc" }
+	noNVENC := func(name string) bool { return name == "vah265enc" || name == "x265enc" }
+	for _, test := range []struct {
+		name       string
+		hasElement func(string) bool
+		want       string
+	}{
+		{name: "all three", hasElement: all, want: "nvh265enc"},
+		{name: "no NVENC", hasElement: noNVENC, want: "vah265enc"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoder, err := selectGstEncoderWithProbe(CaptureConfig{VideoCodec: VideoCodecHEVC, HWAccel: "auto", FPS: 30, Bitrate: 4_000}, test.hasElement, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoder.parts[0] != test.want {
+				t.Fatalf("auto HEVC encoder = %q, want %q", encoder.parts[0], test.want)
+			}
+		})
+	}
+}
+
+func TestAutomaticHighResolutionStaysNVENCOnly(t *testing.T) {
+	elements := map[string]bool{
+		"vah265enc":         true,
+		"h265parse":         true,
+		"rtph265pay":        true,
+		"rtponviftimestamp": true,
+		"rtpstreampay":      true,
+	}
+	if automaticHEVCAvailableWithProbe("auto", func(name string) bool { return elements[name] }) {
+		t.Fatal("automatic HEVC accepted vah265enc; automatic high-resolution mode is NVENC-only")
+	}
+}
+
+func TestExplicitHEVCWithNoEncoderSaysWhichToInstall(t *testing.T) {
+	none := func(string) bool { return false }
+	_, err := selectGstEncoderWithProbe(CaptureConfig{VideoCodec: VideoCodecHEVC, HWAccel: "auto", FPS: 30, Bitrate: 4_000}, none, false)
+	if err == nil {
+		t.Fatal("explicit HEVC with no encoder succeeded")
+	}
+	if want := "HEVC requires GStreamer nvh265enc, vah265enc or x265enc; none is available"; err.Error() != want {
+		t.Fatalf("auto error = %q, want %q", err, want)
+	}
+	_, err = selectGstEncoderWithProbe(CaptureConfig{VideoCodec: VideoCodecHEVC, HWAccel: "openh264", FPS: 30, Bitrate: 4_000}, none, false)
+	if err == nil || !strings.Contains(err.Error(), "nvenc, vaapi or none") {
+		t.Fatalf("non-auto error = %v, want it to list nvenc, vaapi or none", err)
+	}
+}
+
 func TestHEVCTestCaptureProducesUsableSampleDescription(t *testing.T) {
 	if !hasGstElement("x265enc") || !supportsTimestampedVideoOutput(VideoCodecHEVC) {
 		t.Skip("GStreamer HEVC timestamp pipeline is unavailable")

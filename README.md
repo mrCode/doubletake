@@ -296,7 +296,8 @@ fail if their required GStreamer encoder is unavailable; `none` forces x264 for
 H.264 or x265 for explicitly requested HEVC.
 The normal `-video-codec auto` path uses H.264 at the receiver's nominal canvas
 for compatibility across AirPlay receiver generations. Explicit
-`-video-codec hevc` remains available with `nvh265enc` or `x265enc`; use
+`-video-codec hevc` remains available with `nvh265enc`, `vah265enc` or
+`x265enc`, tried in that order under `-hwaccel auto`; use
 `-hwaccel none` to force the software path.
 
 Main10 alone does not turn an SDR X11 or portal capture into HDR: doubletake
