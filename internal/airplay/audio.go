@@ -714,9 +714,13 @@ type AudioStream struct {
 	ct              byte   // AirPlay compression type (2=ALAC, 8=AAC-ELD)
 	spf             uint16 // samples per frame
 	latencySamples  uint32 // audio latency in samples (for sync packets)
-	mu              sync.Mutex
-	historyMu       sync.RWMutex
-	packetHistory   [audioRetransmitHistoryPackets]audioPacketHistoryEntry
+	// marginGuard decides when StreamAudio skips ahead to win back a lost
+	// playout margin. Nil means newAudioMarginGuard(latencySamples); tests
+	// shorten its timings.
+	marginGuard   *audioMarginGuard
+	mu            sync.Mutex
+	historyMu     sync.RWMutex
+	packetHistory [audioRetransmitHistoryPackets]audioPacketHistoryEntry
 }
 
 // AudioCodec returns the codec negotiated for this mirror session.
@@ -1654,6 +1658,16 @@ videoReady:
 	frameSendGaps := 0
 	minRedundantFrames := audioRedundancyCount
 	maxRedundantFrames := 0
+	marginGuard := audioStream.marginGuard
+	if marginGuard == nil {
+		marginGuard = newAudioMarginGuard(audioStream.latencySamples)
+	}
+	// skipBuf receives the frames a margin skip reads. When nothing was queued
+	// behind the frame in hand, the frame it read waits there as pendingFrameSize
+	// bytes and is sent next.
+	skipBuf := make([]byte, len(frameBuf))
+	pendingFrameSize := 0
+	var pendingFramePosition audioPCMFramePosition
 
 	for {
 		select {
@@ -1666,6 +1680,11 @@ videoReady:
 		usingFirstFrame := useFirstFrame
 		if usingFirstFrame {
 			useFirstFrame = false
+		} else if pendingFrameSize > 0 {
+			n, framePosition = pendingFrameSize, pendingFramePosition
+			copy(frameBuf, skipBuf[:n])
+			pendingFrameSize = 0
+			framePTS = framePosition.PTS
 		} else {
 			n, framePosition, err = capture.readFramePosition(frameBuf)
 			if err != nil {
@@ -1700,6 +1719,36 @@ videoReady:
 		if staleFrames > 0 {
 			dbg("[AUDIO] source caught up after dropping %d stale frames", staleFrames)
 			staleFrames = 0
+		}
+		// A sustained loss of playout margin (source-age above half the latency
+		// for a second) may mean audio is queueing up before this loop. Skip the
+		// queued backlog once; the sent frames' source positions jump forward and
+		// the RTP clock carries that gap like the stale-frame drops above.
+		if !usingFirstFrame && timestampedAudio {
+			observedAt := time.Now()
+			age := observedAt.Sub(framePTS)
+			if skip, lateFor := marginGuard.observe(age, observedAt); skip {
+				result, err := skipAudioBacklog(func() (int, audioPCMFramePosition, error) {
+					return capture.readFramePosition(skipBuf)
+				}, time.Now, audioSamplesDuration(uint64(spf)), marginGuard.freshAge(), age)
+				if err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return fmt.Errorf("audio read frame: %w", err)
+				}
+				logAudioMarginSkip(age, lateFor, result, audioSamplesDuration(uint64(spf)))
+				if result.discarded == 0 {
+					pendingFrameSize, pendingFramePosition = result.n, result.position
+				} else {
+					n, framePosition, framePTS = result.n, result.position, result.position.PTS
+					copy(frameBuf, skipBuf[:n])
+					if audioFrameIsStale(framePTS, time.Now(), audioStream.latencySamples, 0) {
+						staleFrames++
+						continue
+					}
+				}
+			}
 		}
 		if frameCount > 0 {
 			if timestampedAudio {

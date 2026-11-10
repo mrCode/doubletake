@@ -417,6 +417,23 @@ func streamAudioPacketsForTest(t *testing.T, security string, frames audioPCMFra
 
 func streamAudioPacketsForCodecTest(t *testing.T, security string, frames audioPCMFrameReader, count int, codec AudioCodec, rfc2198 bool, latencyOverride ...uint32) (*AudioStream, [][]byte) {
 	t.Helper()
+	return streamAudioPacketsWithConfigForTest(t, security, frames, count, codec, func(stream *AudioStream) {
+		stream.rfc2198 = rfc2198
+		if len(latencyOverride) > 0 {
+			stream.latencySamples = latencyOverride[0]
+		}
+	})
+}
+
+// streamAudioPacketsWithStreamForTest streams every frame the reader has, after
+// configure adjusts the AudioStream, and returns the data packets sent.
+func streamAudioPacketsWithStreamForTest(t *testing.T, security string, frames audioPCMFrameReader, codec AudioCodec, configure func(*AudioStream)) (*AudioStream, [][]byte) {
+	t.Helper()
+	return streamAudioPacketsWithConfigForTest(t, security, frames, 1, codec, configure)
+}
+
+func streamAudioPacketsWithConfigForTest(t *testing.T, security string, frames audioPCMFrameReader, count int, codec AudioCodec, configure func(*AudioStream)) (*AudioStream, [][]byte) {
+	t.Helper()
 	ctrlConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -428,15 +445,14 @@ func streamAudioPacketsForCodecTest(t *testing.T, security string, frames audioP
 	}
 	t.Cleanup(func() { ctrlPeer.Close() })
 	dataConn := &recordingPacketConn{}
-	latencySamples := uint32(audioSampleRate)
-	if len(latencyOverride) > 0 {
-		latencySamples = latencyOverride[0]
-	}
 	stream := &AudioStream{
 		conn: dataConn, ctrlConn: ctrlConn, remoteAddr: &netUDPAddrForAudioTest,
 		ctrlAddr: ctrlPeer.LocalAddr().(*net.UDPAddr),
 		// This fixture tests packet order, independent of scheduler latency.
-		ct: byte(codec), latencySamples: latencySamples, rfc2198: rfc2198,
+		ct: byte(codec), latencySamples: audioSampleRate,
+	}
+	if configure != nil {
+		configure(stream)
 	}
 	_, codecSPF, _, _, _, _ := codec.Info()
 	stream.spf = uint16(codecSPF)
