@@ -3,7 +3,6 @@ package airplay
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,230 +12,168 @@ import (
 	"time"
 )
 
-// observeAudioMarginForTest feeds the guard one source-age sample every step
-// from start to end (inclusive) and returns the offsets at which it skipped.
-func observeAudioMarginForTest(g *audioMarginGuard, base time.Time, from, to, step time.Duration, age func(time.Duration) time.Duration) []time.Duration {
-	var skips []time.Duration
+// marginEventsForTest feeds the guard one source-age sample every step from
+// from to to (inclusive), skipping instants for which age reports ok=false (no
+// frame observed then), and returns each event with its offset.
+func marginEventsForTest(g *audioMarginGuard, from, to, step time.Duration, age func(time.Duration) (time.Duration, bool)) []string {
+	base := time.Unix(1000, 0)
+	var events []string
 	for at := from; at <= to; at += step {
-		if skip, _ := g.observe(age(at), base.Add(at)); skip {
-			skips = append(skips, at)
+		frameAge, ok := age(at)
+		if !ok {
+			continue
+		}
+		switch g.observe(frameAge, base.Add(at)) {
+		case audioMarginLost:
+			events = append(events, fmt.Sprintf("lost@%v", at))
+		case audioMarginRecovered:
+			events = append(events, fmt.Sprintf("recovered@%v", at))
 		}
 	}
-	return skips
+	return events
 }
 
-func TestAudioMarginGuardSkipsOnceAfterOneSecondOfLostMargin(t *testing.T) {
-	g := newAudioMarginGuard(4410) // 100 ms playout budget
-	base := time.Unix(1000, 0)
-	for at := time.Duration(0); at < time.Second; at += 10 * time.Millisecond {
-		if skip, _ := g.observe(60*time.Millisecond, base.Add(at)); skip {
-			t.Fatalf("skipped after only %v above half the playout budget", at)
-		}
-	}
-	skip, lateFor := g.observe(60*time.Millisecond, base.Add(time.Second))
-	if !skip {
-		t.Fatal("did not skip after 1 s with source-age above half the playout budget")
-	}
-	if lateFor != time.Second {
-		t.Fatalf("late-for = %v, want 1s", lateFor)
-	}
-	more := observeAudioMarginForTest(g, base, time.Second+10*time.Millisecond, 2*time.Second, 10*time.Millisecond,
-		func(time.Duration) time.Duration { return 60 * time.Millisecond })
-	if len(more) != 0 {
-		t.Fatalf("skipped again at %v, want one skip", more)
+func constantAgeForTest(age time.Duration) func(time.Duration) (time.Duration, bool) {
+	return func(time.Duration) (time.Duration, bool) { return age, true }
+}
+
+const marginStepForTest = 8 * time.Millisecond // one ALAC frame, roughly
+
+func assertMarginEventsForTest(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("events %v, want %v", got, want)
 	}
 }
 
-func TestAudioMarginGuardWaitsForCooldownBetweenSkips(t *testing.T) {
-	g := newAudioMarginGuard(4410)
-	base := time.Unix(1000, 0)
-	var skips []time.Duration
-	var lateFor []time.Duration
-	for at := time.Duration(0); at <= 12*time.Second; at += 10 * time.Millisecond {
-		if skip, late := g.observe(90*time.Millisecond, base.Add(at)); skip {
-			skips = append(skips, at)
-			lateFor = append(lateFor, late)
-		}
-	}
-	want := []time.Duration{time.Second, 6 * time.Second, 11 * time.Second}
-	if fmt.Sprint(skips) != fmt.Sprint(want) {
-		t.Fatalf("skips at %v, want %v", skips, want)
-	}
-	// Late-for counts from when the audio first fell behind, across skips.
-	if fmt.Sprint(lateFor) != fmt.Sprint(want) {
-		t.Fatalf("late-for at each skip = %v, want %v", lateFor, want)
-	}
+func TestAudioMarginGuardReportsOnceAfterOneSecondOfLostMargin(t *testing.T) {
+	// 30 s of continuous lateness is one episode: one line, never repeated.
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 30*time.Second, marginStepForTest, constantAgeForTest(60*time.Millisecond))
+	assertMarginEventsForTest(t, got, "lost@1s")
+}
+
+func TestAudioMarginGuardReportsRecoveryOnceWhenAgeFallsBack(t *testing.T) {
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 10*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at < 3*time.Second {
+				return 70 * time.Millisecond, true
+			}
+			return 15 * time.Millisecond, true
+		})
+	assertMarginEventsForTest(t, got, "lost@1s", "recovered@3s")
+}
+
+func TestAudioMarginGuardStartsANewEpisodeAfterRecovery(t *testing.T) {
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 10*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at < 2*time.Second || at >= 4*time.Second {
+				return 70 * time.Millisecond, true
+			}
+			return 15 * time.Millisecond, true
+		})
+	assertMarginEventsForTest(t, got, "lost@1s", "recovered@2s", "lost@5s")
 }
 
 func TestAudioMarginGuardIgnoresSpikesShorterThanOneSecond(t *testing.T) {
-	g := newAudioMarginGuard(4410)
-	// 990 ms late, then one on-time frame, repeated for 30 s.
-	skips := observeAudioMarginForTest(g, time.Unix(1000, 0), 0, 30*time.Second, 10*time.Millisecond,
-		func(at time.Duration) time.Duration {
-			if at%time.Second == 990*time.Millisecond {
-				return 15 * time.Millisecond
+	// 992 ms late, then one on-time frame, repeated for 30 s.
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 30*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at%time.Second == 992*time.Millisecond {
+				return 15 * time.Millisecond, true
 			}
-			return 95 * time.Millisecond
+			return 95 * time.Millisecond, true
 		})
-	if len(skips) != 0 {
-		t.Fatalf("short spikes triggered skips at %v", skips)
-	}
+	assertMarginEventsForTest(t, got)
 }
 
 func TestAudioMarginGuardRestartsTimerWhenAgeFallsBelowThreshold(t *testing.T) {
-	g := newAudioMarginGuard(4410)
-	skips := observeAudioMarginForTest(g, time.Unix(1000, 0), 0, 3*time.Second, 10*time.Millisecond,
-		func(at time.Duration) time.Duration {
-			if at == 810*time.Millisecond {
-				return 30 * time.Millisecond
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 3*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at == 800*time.Millisecond {
+				return 30 * time.Millisecond, true
 			}
-			return 70 * time.Millisecond
+			return 70 * time.Millisecond, true
 		})
-	if len(skips) != 1 || skips[0] != 1820*time.Millisecond {
-		t.Fatalf("skips at %v, want one at 1.82s (1 s after the age rose again)", skips)
-	}
+	// No line for the dip either: nothing had been reported yet.
+	assertMarginEventsForTest(t, got, "lost@1.808s")
+}
+
+func TestAudioMarginGuardRestartsTimerAcrossAGapInFrames(t *testing.T) {
+	// Late frames either side of a 400 ms stall (no frames, or only stale ones
+	// that never reach the guard) are not one continuous second of lateness.
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 3*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at > 600*time.Millisecond && at < 1000*time.Millisecond {
+				return 0, false
+			}
+			return 70 * time.Millisecond, true
+		})
+	assertMarginEventsForTest(t, got, "lost@2s")
+}
+
+func TestAudioMarginGuardToleratesAFewMissingFrames(t *testing.T) {
+	// Three frame periods without a frame is ordinary delivery jitter.
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 3*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at > 600*time.Millisecond && at < 624*time.Millisecond {
+				return 0, false
+			}
+			return 70 * time.Millisecond, true
+		})
+	assertMarginEventsForTest(t, got, "lost@1s")
+}
+
+func TestAudioMarginGuardDoesNotRepeatAcrossAGapWhileStillLate(t *testing.T) {
+	got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 5*time.Second, marginStepForTest,
+		func(at time.Duration) (time.Duration, bool) {
+			if at > 2*time.Second && at < 2500*time.Millisecond {
+				return 0, false
+			}
+			return 70 * time.Millisecond, true
+		})
+	assertMarginEventsForTest(t, got, "lost@1s")
 }
 
 func TestAudioMarginGuardThresholdIsHalfThePlayoutLatency(t *testing.T) {
-	constant := func(age time.Duration) func(time.Duration) time.Duration {
-		return func(time.Duration) time.Duration { return age }
+	if got := marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 3*time.Second, marginStepForTest, constantAgeForTest(50*time.Millisecond)); len(got) != 0 {
+		t.Fatalf("age exactly half the 100 ms budget: events %v, want none", got)
 	}
-	base := time.Unix(1000, 0)
-	if skips := observeAudioMarginForTest(newAudioMarginGuard(4410), base, 0, 3*time.Second, 10*time.Millisecond, constant(50*time.Millisecond)); len(skips) != 0 {
-		t.Fatalf("age exactly half the 100 ms budget skipped at %v", skips)
+	assertMarginEventsForTest(t, marginEventsForTest(newAudioMarginGuard(4410, 352), 0, 3*time.Second, marginStepForTest, constantAgeForTest(51*time.Millisecond)), "lost@1s")
+	if got := marginEventsForTest(newAudioMarginGuard(8820, 352), 0, 3*time.Second, marginStepForTest, constantAgeForTest(90*time.Millisecond)); len(got) != 0 {
+		t.Fatalf("90 ms age with a 200 ms budget: events %v, want none", got)
 	}
-	if skips := observeAudioMarginForTest(newAudioMarginGuard(4410), base, 0, 3*time.Second, 10*time.Millisecond, constant(51*time.Millisecond)); len(skips) != 1 {
-		t.Fatalf("age just above half the 100 ms budget skipped at %v, want once", skips)
-	}
-	if skips := observeAudioMarginForTest(newAudioMarginGuard(8820), base, 0, 3*time.Second, 10*time.Millisecond, constant(90*time.Millisecond)); len(skips) != 0 {
-		t.Fatalf("90 ms age with a 200 ms budget skipped at %v", skips)
-	}
-	if skips := observeAudioMarginForTest(newAudioMarginGuard(0), base, 0, 3*time.Second, 10*time.Millisecond, constant(time.Second)); len(skips) != 0 {
-		t.Fatalf("a zero playout budget skipped at %v", skips)
+	if got := marginEventsForTest(newAudioMarginGuard(0, 352), 0, 3*time.Second, marginStepForTest, constantAgeForTest(time.Second)); len(got) != 0 {
+		t.Fatalf("zero playout budget: events %v, want none", got)
 	}
 }
 
-func TestAudioMarginGuardFreshAgeIsTwentyMillisecondsWithinTheBudget(t *testing.T) {
-	if got := newAudioMarginGuard(4410).freshAge(); got != 20*time.Millisecond {
-		t.Fatalf("fresh age at a 100 ms budget = %v, want 20ms", got)
+func TestAudioMarginLogLines(t *testing.T) {
+	logged := captureLogForTest(t, func() {
+		logAudioMargin(audioMarginNone, 70*time.Millisecond, 4410)
+		logAudioMargin(audioMarginLost, 63*time.Millisecond+400*time.Microsecond, 4410)
+		logAudioMargin(audioMarginRecovered, 12*time.Millisecond, 4410)
+	})
+	lines := strings.Split(strings.TrimSpace(logged), "\n")
+	want := []string{
+		"[AUDIO] audio is arriving 63ms late (margin 37ms of 100ms); the delay is before the helper",
+		"[AUDIO] playout margin recovered",
 	}
-	// A budget so small that half of it is under 20 ms: fresh must still be
-	// below the trigger threshold, or a skip could stop on a frame that is late.
-	if got, threshold := newAudioMarginGuard(882).freshAge(), audioLatencyDuration(882)/2; got != threshold {
-		t.Fatalf("fresh age at a 20 ms budget = %v, want the %v threshold", got, threshold)
+	if len(lines) != len(want) {
+		t.Fatalf("log = %q, want %q", logged, want)
 	}
-}
-
-// scriptedAudioBacklog is a capture queue on a fake clock: each read takes
-// wait, then returns a frame that is age old.
-type scriptedAudioBacklog struct {
-	clock  time.Time
-	frames []scriptedAudioFrame
-	reads  int
-}
-
-type scriptedAudioFrame struct {
-	age  time.Duration
-	wait time.Duration
-}
-
-func (b *scriptedAudioBacklog) now() time.Time { return b.clock }
-
-func (b *scriptedAudioBacklog) read() (int, audioPCMFramePosition, error) {
-	if b.reads == len(b.frames) {
-		return 0, audioPCMFramePosition{}, io.EOF
-	}
-	frame := b.frames[b.reads]
-	b.reads++
-	b.clock = b.clock.Add(frame.wait)
-	return 100 + b.reads, audioPCMFramePosition{PTS: b.clock.Add(-frame.age), SourceRTP: uint32(b.reads) * 352, HasSourceRTP: true}, nil
-}
-
-const scriptedAudioFrameDuration = 8 * time.Millisecond
-
-func TestSkipAudioBacklogDiscardsQueuedFramesUntilOneIsFresh(t *testing.T) {
-	backlog := &scriptedAudioBacklog{clock: time.Unix(1000, 0)}
-	for _, age := range []time.Duration{72, 64, 56, 48, 40, 32, 24, 16, 8} {
-		backlog.frames = append(backlog.frames, scriptedAudioFrame{age: age * time.Millisecond})
-	}
-	got, err := skipAudioBacklog(backlog.read, backlog.now, scriptedAudioFrameDuration, 20*time.Millisecond, 80*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The frame in hand plus the 72..24 ms frames are discarded; 16 ms is fresh.
-	if got.discarded != 8 || got.age != 16*time.Millisecond || !got.restored || got.n != 108 {
-		t.Fatalf("skip = %+v, want 8 discarded and the 16 ms frame (n=108) kept as restored", got)
-	}
-	if backlog.reads != 8 {
-		t.Fatalf("read %d frames, want to stop at the first fresh one (8)", backlog.reads)
-	}
-}
-
-func TestSkipAudioBacklogStopsWhenTheQueueRunsDry(t *testing.T) {
-	backlog := &scriptedAudioBacklog{clock: time.Unix(1000, 0), frames: []scriptedAudioFrame{
-		{age: 72 * time.Millisecond},
-		{age: 64 * time.Millisecond},
-		// Nothing more is queued: this read waits for the next live frame.
-		{age: 62 * time.Millisecond, wait: scriptedAudioFrameDuration},
-		{age: 10 * time.Millisecond},
-	}}
-	got, err := skipAudioBacklog(backlog.read, backlog.now, scriptedAudioFrameDuration, 20*time.Millisecond, 80*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.discarded != 3 || got.n != 103 || got.restored {
-		t.Fatalf("skip = %+v, want 3 discarded and the frame that had to be waited for (n=103), not restored", got)
-	}
-	if backlog.reads != 3 {
-		t.Fatalf("read %d frames, want to stop once a read had to wait (3)", backlog.reads)
-	}
-}
-
-func TestSkipAudioBacklogKeepsTheFrameInHandWhenNothingIsQueued(t *testing.T) {
-	// The delay is before the queue: the very first read waits. Discarding the
-	// frame in hand would only punch a hole without gaining any margin.
-	backlog := &scriptedAudioBacklog{clock: time.Unix(1000, 0), frames: []scriptedAudioFrame{
-		{age: 90 * time.Millisecond, wait: scriptedAudioFrameDuration},
-	}}
-	got, err := skipAudioBacklog(backlog.read, backlog.now, scriptedAudioFrameDuration, 20*time.Millisecond, 90*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.discarded != 0 || got.n != 101 || got.restored {
-		t.Fatalf("skip = %+v, want nothing discarded and the next frame returned to send after the one in hand", got)
-	}
-}
-
-func TestSkipAudioBacklogDiscardsAtMostTheLateAudio(t *testing.T) {
-	// A queue that never yields a fresh frame must not swallow audio forever:
-	// a backlog cannot hold more audio than the frame in hand was late.
-	backlog := &scriptedAudioBacklog{clock: time.Unix(1000, 0)}
-	for range 100 {
-		backlog.frames = append(backlog.frames, scriptedAudioFrame{age: 80 * time.Millisecond})
-	}
-	got, err := skipAudioBacklog(backlog.read, backlog.now, scriptedAudioFrameDuration, 20*time.Millisecond, 80*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.discarded != 10 || got.restored || backlog.reads != 10 {
-		t.Fatalf("skip = %+v after %d reads, want 10 frames (80 ms) discarded, not restored", got, backlog.reads)
-	}
-}
-
-func TestSkipAudioBacklogReturnsReadErrors(t *testing.T) {
-	backlog := &scriptedAudioBacklog{clock: time.Unix(1000, 0), frames: []scriptedAudioFrame{{age: 80 * time.Millisecond}}}
-	if _, err := skipAudioBacklog(backlog.read, backlog.now, scriptedAudioFrameDuration, 20*time.Millisecond, 80*time.Millisecond); !errors.Is(err, io.EOF) {
-		t.Fatalf("error = %v, want the capture's EOF", err)
+	for i := range want {
+		if !strings.HasSuffix(lines[i], want[i]) {
+			t.Fatalf("log line %d = %q, want it to end %q", i, lines[i], want[i])
+		}
 	}
 }
 
 // agedTimestampedPCMFramesForTest returns frames whose source-age at read time
 // follows ages[i]; source positions advance by one codec frame per read.
 type agedTimestampedPCMFramesForTest struct {
-	ages  []time.Duration
-	waits map[int]time.Duration // reads that block, as on an empty queue
-	read  int
-	spf   uint32
+	ages []time.Duration
+	read int
+	spf  uint32
 }
 
 func (r *agedTimestampedPCMFramesForTest) ReadPCMFrame(dst []byte) (time.Time, error) {
@@ -248,7 +185,6 @@ func (r *agedTimestampedPCMFramesForTest) ReadPCMFramePosition(dst []byte) (audi
 	if r.read == len(r.ages) {
 		return audioPCMFramePosition{}, io.EOF
 	}
-	time.Sleep(r.waits[r.read])
 	position := audioPCMFramePosition{
 		PTS:          time.Now().Add(-r.ages[r.read]),
 		SourceRTP:    uint32(r.read) * r.spf,
@@ -282,17 +218,6 @@ func assertSentAudioPayloadsMatchSourceFramesForTest(t *testing.T, stream *Audio
 			t.Fatalf("sequence %d (source frame %d) carries another frame's audio", binary.BigEndian.Uint16(packet[2:4]), frame)
 		}
 	}
-}
-
-func lateAudioScriptForTest() []time.Duration {
-	ms := time.Millisecond
-	ages := []time.Duration{11 * ms, 11 * ms, 11 * ms, 11 * ms, 11 * ms} // frames 0-4: on time
-	ages = append(ages, 80*ms, 80*ms, 80*ms)                             // frames 5-7: suddenly 80 ms old
-	ages = append(ages, 72*ms, 64*ms, 56*ms, 48*ms, 40*ms, 32*ms, 24*ms) // frames 8-14: the rest of the backlog
-	for range 10 {
-		ages = append(ages, 12*ms) // frames 15-24: fresh again
-	}
-	return ages
 }
 
 // sentAudioSourceFramesForTest returns, in sequence order, which source frame
@@ -332,77 +257,34 @@ func captureLogForTest(t *testing.T, fn func()) string {
 	return out.String()
 }
 
-// quickMarginGuardForTest keeps production thresholds but skips on the second
-// late frame: these captures are read as fast as the loop runs, so the real
-// one-second wait would need a second of fake audio per test.
-func quickMarginGuardForTest(stream *AudioStream) {
-	stream.latencySamples = 4410
-	guard := newAudioMarginGuard(stream.latencySamples)
-	guard.sustain = time.Nanosecond
-	stream.marginGuard = guard
-}
-
-func TestStreamAudioSkipsAheadWhenAudioStaysLate(t *testing.T) {
-	reader := &agedTimestampedPCMFramesForTest{ages: lateAudioScriptForTest(), spf: 352}
-	var stream *AudioStream
-	var packets [][]byte
-	logged := captureLogForTest(t, func() {
-		stream, packets = streamAudioPacketsWithStreamForTest(t, "plaintext", reader, AudioCodecALAC, quickMarginGuardForTest)
-	})
-	// The age is whatever the scheduler made of 80 ms; only the shape is fixed.
-	if strings.Count(logged, "skipped ahead to restore the playout margin") != 1 ||
-		!regexp.MustCompile(`\[AUDIO\] audio arrived (79|8[0-9])ms late for [0-9.]+[mµn]?s; skipped ahead`).MatchString(logged) {
-		t.Fatalf("log = %q, want one skip-ahead line", logged)
-	}
-	got := sentAudioSourceFramesForTest(t, packets, 352)
-	// Frame 5 starts the late run and is sent; frame 6 triggers the skip, which
-	// discards 6-14 and resumes at the first fresh frame, then keeps sending.
-	want := []uint32{0, 1, 2, 3, 4, 5, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}
-	if len(got) != len(want) {
-		t.Fatalf("sent source frames %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("sent source frames %v, want %v", got, want)
-		}
-	}
-	assertSentAudioPayloadsMatchSourceFramesForTest(t, stream, packets, 352)
-}
-
-func TestStreamAudioSendsEveryFrameThroughAShortLateSpike(t *testing.T) {
-	reader := &agedTimestampedPCMFramesForTest{ages: lateAudioScriptForTest(), spf: 352}
-	stream, packets := streamAudioPacketsWithStreamForTest(t, "plaintext", reader, AudioCodecALAC, func(stream *AudioStream) {
-		stream.latencySamples = 4410 // the default guard: 1 s of lateness before any skip
-	})
-	got := sentAudioSourceFramesForTest(t, packets, 352)
-	if len(got) != len(reader.ages) {
-		t.Fatalf("sent source frames %v, want all %d frames", got, len(reader.ages))
-	}
-	for i, frame := range got {
-		if frame != uint32(i) {
-			t.Fatalf("sent source frames %v, want every frame in order", got)
-		}
-	}
-	assertSentAudioPayloadsMatchSourceFramesForTest(t, stream, packets, 352)
-}
-
-func TestStreamAudioKeepsEveryFrameWhenNothingIsQueuedToSkip(t *testing.T) {
+func TestStreamAudioNeverDropsLateButPlayableFrames(t *testing.T) {
 	ms := time.Millisecond
-	ages := []time.Duration{11 * ms, 11 * ms, 11 * ms, 11 * ms, 11 * ms}
-	for range 8 {
-		ages = append(ages, 80*ms) // frames 5-12: late, but nothing queued behind them
+	// A 1 s playout budget leaves wide margins either side of the 500 ms
+	// threshold, so scheduler stalls cannot change which frames count as late.
+	var ages []time.Duration
+	for range 5 {
+		ages = append(ages, 1*ms)
 	}
-	// The skip triggers on frame 6; reading frame 7 has to wait for it to be
-	// captured, so the delay is upstream and there is no backlog to drop.
-	reader := &agedTimestampedPCMFramesForTest{ages: ages, spf: 352, waits: map[int]time.Duration{7: 10 * ms}}
+	for range 20 {
+		ages = append(ages, 700*ms) // late, still 300 ms before its deadline
+	}
+	for range 5 {
+		ages = append(ages, 1*ms)
+	}
+	reader := &agedTimestampedPCMFramesForTest{ages: ages, spf: 352}
 	var stream *AudioStream
 	var packets [][]byte
 	logged := captureLogForTest(t, func() {
-		stream, packets = streamAudioPacketsWithStreamForTest(t, "plaintext", reader, AudioCodecALAC, quickMarginGuardForTest)
+		stream, packets = streamAudioPacketsWithStreamForTest(t, "plaintext", reader, AudioCodecALAC, func(stream *AudioStream) {
+			// This capture is read as fast as the loop runs; report at the second
+			// late frame instead of after a second of them, and never treat a
+			// scheduler stall as a gap.
+			guard := newAudioMarginGuard(stream.latencySamples, uint32(stream.spf))
+			guard.sustain = time.Nanosecond
+			guard.maxGap = time.Hour
+			stream.marginGuard = guard
+		})
 	})
-	if !strings.Contains(logged, "nothing was queued to skip") || strings.Contains(logged, "skipped ahead") {
-		t.Fatalf("log = %q, want the nothing-queued line and no skip", logged)
-	}
 	got := sentAudioSourceFramesForTest(t, packets, 352)
 	if len(got) != len(ages) {
 		t.Fatalf("sent source frames %v, want all %d frames", got, len(ages))
@@ -413,4 +295,16 @@ func TestStreamAudioKeepsEveryFrameWhenNothingIsQueuedToSkip(t *testing.T) {
 		}
 	}
 	assertSentAudioPayloadsMatchSourceFramesForTest(t, stream, packets, 352)
+	if n := strings.Count(logged, "[AUDIO] audio is arriving "); n != 1 {
+		t.Fatalf("log = %q, want the late-audio line once, got %d", logged, n)
+	}
+	if !regexp.MustCompile(`\[AUDIO\] audio is arriving 7[0-9][0-9]ms late \(margin [0-9]+ms of 1s\); the delay is before the helper`).MatchString(logged) {
+		t.Fatalf("log = %q, want the late-audio line with its age and margin", logged)
+	}
+	if n := strings.Count(logged, "[AUDIO] playout margin recovered"); n != 1 {
+		t.Fatalf("log = %q, want the recovery line once, got %d", logged, n)
+	}
+	if strings.Index(logged, "audio is arriving") > strings.Index(logged, "playout margin recovered") {
+		t.Fatalf("log = %q, want the recovery after the late line", logged)
+	}
 }

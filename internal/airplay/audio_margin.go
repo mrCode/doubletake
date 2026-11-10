@@ -8,133 +8,88 @@ import (
 // The receiver plays each audio frame a fixed playout latency after its source
 // PTS, so playout lead = latency - source-age. When something before the send
 // loop starts holding audio back, every frame arrives later and the lead
-// shrinks; at about 40 ms left an Apple TV turns robotic, and with none left it
-// goes silent. These thresholds decide when the margin counts as lost and how
-// far a skip goes to win it back.
+// shrinks: at about 40 ms left an Apple TV turns robotic, and with none left it
+// goes silent. The send loop reads as fast as frames arrive, so a backlog in
+// its own read path drains by itself; a lasting loss of lead is a delay before
+// the helper, which dropping frames cannot undo. The guard therefore only
+// reports it, once per episode, so a hardware log says where the delay is.
 const (
 	// audioMarginLostFor is how long source-age must stay above half the
-	// playout latency before a skip. Ordinary jitter is far shorter.
+	// playout latency before it is reported. Ordinary jitter is far shorter.
 	audioMarginLostFor = time.Second
-	// audioMarginSkipCooldown separates skips, so a delay the helper cannot
-	// remove does not keep cutting holes into the audio.
-	audioMarginSkipCooldown = 5 * time.Second
-	// audioMarginFreshAge is the source-age at which a skip stops discarding.
-	audioMarginFreshAge = 20 * time.Millisecond
+	// audioMarginMaxGapFrames is how many frame periods may pass without an
+	// observed frame (a stall, or a run of stale frames) before the lateness
+	// counts as interrupted and its timer restarts.
+	audioMarginMaxGapFrames = 4
 )
 
-// audioMarginGuard watches the source-age of sent frames and says when to skip
-// ahead: once age has stayed above half the playout latency for sustain, and
-// not again until cooldown has passed. It is pure; StreamAudio feeds it.
+type audioMarginEvent int
+
+const (
+	audioMarginNone audioMarginEvent = iota
+	// audioMarginLost: source-age has stayed above the threshold for sustain.
+	audioMarginLost
+	// audioMarginRecovered: source-age fell back after a reported loss.
+	audioMarginRecovered
+)
+
+// audioMarginGuard watches the source-age of frames about to be sent. It is
+// pure; StreamAudio feeds it and logs its events.
 type audioMarginGuard struct {
 	threshold time.Duration
 	sustain   time.Duration
-	cooldown  time.Duration
-	highSince time.Time
-	lastSkip  time.Time
+	maxGap    time.Duration
+
+	highSince    time.Time
+	lastObserved time.Time
+	reported     bool
 }
 
-func newAudioMarginGuard(latencySamples uint32) *audioMarginGuard {
+func newAudioMarginGuard(latencySamples, frameSamples uint32) *audioMarginGuard {
 	return &audioMarginGuard{
 		threshold: audioLatencyDuration(latencySamples) / 2,
 		sustain:   audioMarginLostFor,
-		cooldown:  audioMarginSkipCooldown,
+		maxGap:    audioMarginMaxGapFrames * audioSamplesDuration(uint64(frameSamples)),
 	}
 }
 
-// observe records the source-age of a frame about to be sent at now. It
-// reports whether to skip ahead, and for how long age has been continuously
-// above the threshold (a skip does not restart that clock).
-func (g *audioMarginGuard) observe(age time.Duration, now time.Time) (skip bool, lateFor time.Duration) {
-	if g.threshold <= 0 || age <= g.threshold {
-		g.highSince = time.Time{}
-		return false, 0
+// observe records the source-age of a frame about to be sent at now and
+// returns at most one event per change of state: Lost once age has stayed
+// above the threshold for sustain without a gap longer than maxGap, then
+// nothing until age falls back to the threshold or below, which is Recovered.
+func (g *audioMarginGuard) observe(age time.Duration, now time.Time) audioMarginEvent {
+	if g.threshold <= 0 {
+		return audioMarginNone
 	}
-	if g.highSince.IsZero() {
+	gap := !g.lastObserved.IsZero() && now.Sub(g.lastObserved) > g.maxGap
+	g.lastObserved = now
+	if age <= g.threshold {
+		g.highSince = time.Time{}
+		if g.reported {
+			g.reported = false
+			return audioMarginRecovered
+		}
+		return audioMarginNone
+	}
+	if g.highSince.IsZero() || gap {
 		g.highSince = now
 	}
-	lateFor = now.Sub(g.highSince)
-	if lateFor < g.sustain {
-		return false, lateFor
+	if !g.reported && now.Sub(g.highSince) >= g.sustain {
+		g.reported = true
+		return audioMarginLost
 	}
-	if !g.lastSkip.IsZero() && now.Sub(g.lastSkip) < g.cooldown {
-		return false, lateFor
-	}
-	g.lastSkip = now
-	return true, lateFor
+	return audioMarginNone
 }
 
-// freshAge is the source-age at which a skip stops. It never exceeds the
-// trigger threshold, so a skip cannot end on a frame that still counts as late.
-func (g *audioMarginGuard) freshAge() time.Duration {
-	if g.threshold < audioMarginFreshAge {
-		return g.threshold
+// logAudioMargin prints the line for a guard event; audioMarginNone prints
+// nothing.
+func logAudioMargin(event audioMarginEvent, age time.Duration, latencySamples uint32) {
+	switch event {
+	case audioMarginLost:
+		latency := audioLatencyDuration(latencySamples)
+		log.Printf("[AUDIO] audio is arriving %v late (margin %v of %v); the delay is before the helper",
+			age.Round(time.Millisecond), (latency - age).Round(time.Millisecond), latency.Round(time.Millisecond))
+	case audioMarginRecovered:
+		log.Printf("[AUDIO] playout margin recovered")
 	}
-	return audioMarginFreshAge
-}
-
-// audioBacklogSkip is the outcome of skipAudioBacklog.
-type audioBacklogSkip struct {
-	// n and position describe the last frame read, which the caller sends.
-	n        int
-	position audioPCMFramePosition
-	age      time.Duration
-	// discarded counts the frames dropped, including the one in hand when the
-	// skip began. Zero means nothing was queued behind that frame: the caller
-	// sends it, then this one.
-	discarded int
-	// restored reports that the returned frame is fresh.
-	restored bool
-}
-
-// skipAudioBacklog discards queued capture frames, starting with the frame in
-// hand, until a frame is fresh, a read has to wait for the next live frame (the
-// queue is empty), or limit worth of audio has been discarded: a queue cannot
-// hold more audio than the frame in hand was late, so a capture that never
-// yields a fresh frame cannot swallow audio indefinitely. Frames are dropped
-// whole, so the source positions jump forward and the RTP clock maps the gap
-// exactly as it maps the stale-frame path's drops.
-func skipAudioBacklog(read func() (int, audioPCMFramePosition, error), now func() time.Time, frameDuration, freshAge, limit time.Duration) (audioBacklogSkip, error) {
-	discarded := 0
-	for {
-		started := now()
-		n, position, err := read()
-		if err != nil {
-			return audioBacklogSkip{discarded: discarded}, err
-		}
-		finished := now()
-		if n == 0 {
-			continue
-		}
-		age := finished.Sub(position.PTS)
-		// A read that blocks for half a codec frame found the queue empty and
-		// waited for the next live frame.
-		empty := finished.Sub(started) >= frameDuration/2
-		if discarded == 0 && empty {
-			// Nothing was queued behind the frame in hand. Dropping it would
-			// only punch a hole in the audio without gaining any margin.
-			return audioBacklogSkip{n: n, position: position, age: age, restored: age < freshAge}, nil
-		}
-		discarded++
-		if age < freshAge || empty || time.Duration(discarded)*frameDuration >= limit {
-			return audioBacklogSkip{n: n, position: position, age: age, discarded: discarded, restored: age < freshAge}, nil
-		}
-	}
-}
-
-func logAudioMarginSkip(age, lateFor time.Duration, skip audioBacklogSkip, frameDuration time.Duration) {
-	age = age.Round(time.Millisecond)
-	lateFor = lateFor.Round(time.Millisecond)
-	now := skip.age.Round(time.Millisecond)
-	switch {
-	case skip.discarded == 0:
-		log.Printf("[AUDIO] audio arrived %v late for %v; nothing was queued to skip, so the delay is before the helper (still %v late)",
-			age, lateFor, now)
-	case skip.restored:
-		log.Printf("[AUDIO] audio arrived %v late for %v; skipped ahead to restore the playout margin", age, lateFor)
-	default:
-		log.Printf("[AUDIO] audio arrived %v late for %v; skipped %v of queued audio but it is still %v late",
-			age, lateFor, (time.Duration(skip.discarded) * frameDuration).Round(time.Millisecond), now)
-	}
-	dbg("[AUDIO] margin skip discarded %d frames (%v); resuming at source-age %v",
-		skip.discarded, (time.Duration(skip.discarded) * frameDuration).Round(time.Millisecond), now)
 }
