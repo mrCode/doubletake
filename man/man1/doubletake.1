@@ -99,14 +99,6 @@ Largest video canvas to negotiate, for example \fB2560x1440\fR. The cap only
 shrinks the canvas the codec would use, keeping its aspect ratio and even
 dimensions; it never exceeds the receiver's maximum. Empty means no cap.
 .TP
-.B \-print-canvas
-Print one line, \fBcanvas\fR \fIWIDTH\fBx\fIHEIGHT\fR, giving the canvas the
-receiver at \fB\-target\fR would get under \fB\-video-codec\fR and
-\fB\-max-size\fR, and exit 0. It sends only an unauthenticated GET /info: it
-does not pair, read or write credentials, or start a capture. When it cannot
-tell, including when the receiver advertises no display before a session, it
-prints \fBcanvas unknown:\fR \fIREASON\fR and exits 1.
-.TP
 .B \-debug
 Enable verbose protocol logging
 .TP

@@ -87,54 +87,6 @@ func positiveDecimal(text string) (int, bool) {
 	return value, err == nil && value > 0
 }
 
-// printCanvas writes the one line castr reads before sizing an output for a
-// receiver: "canvas WIDTHxHEIGHT", the canvas a cast with this codec and cap
-// would negotiate, or "canvas unknown: REASON". It returns the exit code.
-//
-// It sends the receiver one unauthenticated GET /info and nothing else: no
-// pairing, no credentials read or written, no capture and no portal.
-func printCanvas(out io.Writer, target string, port int, codec, maxSize string) int {
-	fail := func(format string, args ...any) int {
-		// The reason can quote the receiver's reply; keep it to one line.
-		reason := strings.Join(strings.Fields(fmt.Sprintf(format, args...)), " ")
-		fmt.Fprintf(out, "canvas unknown: %s\n", reason)
-		return 1
-	}
-	if target == "" {
-		return fail("-print-canvas needs -target")
-	}
-	if err := airplay.ValidateVideoCodec(codec); err != nil {
-		return fail("invalid -video-codec: %v", err)
-	}
-	maxWidth, maxHeight, err := parseMaxSize(maxSize)
-	if err != nil {
-		return fail("%v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	client := airplay.NewAirPlayClient(target, port)
-	if err := client.Connect(ctx); err != nil {
-		return fail("connect: %v", err)
-	}
-	defer func() { _ = client.Close() }()
-	info, err := client.GetInfo()
-	if err != nil {
-		return fail("get info: %v", err)
-	}
-	// Without a display the canvas would be a guess from feature bits, which
-	// the session's own display can contradict.
-	if width, height := info.DisplaySize(); width <= 0 || height <= 0 {
-		return fail("receiver advertises no display before a session")
-	}
-	width, height, err := info.SelectedVideoCanvas(airplay.VideoCodec(codec), maxWidth, maxHeight)
-	if err != nil {
-		return fail("%v", err)
-	}
-	fmt.Fprintf(out, "canvas %dx%d\n", width, height)
-	return 0
-}
-
 func main() {
 	target := flag.String("target", "", "Apple TV IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
@@ -161,12 +113,7 @@ func main() {
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	audioSource := flag.String("audio-source", "", "PulseAudio/PipeWire source to capture audio from (e.g. a null sink monitor); empty = default output monitor")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
-	printCanvasOnly := flag.Bool("print-canvas", false, "Print the video canvas the receiver at -target would get (\"canvas WIDTHxHEIGHT\", honouring -video-codec and -max-size) and exit, without pairing, credentials or capture")
 	flag.Parse()
-	if *printCanvasOnly {
-		airplay.SetDebugMode(*debug)
-		os.Exit(printCanvas(os.Stdout, *target, *port, *videoCodec, *maxSize))
-	}
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
 	}
