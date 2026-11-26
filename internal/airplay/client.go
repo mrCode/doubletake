@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -51,6 +52,7 @@ type ReceiverInfo struct {
 	Displays                      []DisplayInfo       `plist:"displays"`
 	hasPTPInfo                    bool
 	hasSupportedFormats           bool
+	hasInitialVolume              bool
 }
 
 // FormatMask preserves the unsigned bit pattern of signed or unsigned plist
@@ -566,6 +568,7 @@ func (c *AirPlayClient) getInfoWithTimeout(timeout time.Duration) (*ReceiverInfo
 	info.Server = responseHeaders["server"]
 	_, info.hasPTPInfo = fullInfo["PTPInfo"]
 	_, info.hasSupportedFormats = fullInfo["supportedFormats"]
+	_, info.hasInitialVolume = fullInfo["initialVolume"]
 
 	c.mu.Lock()
 	var advertisement *AirPlayDevice
@@ -642,8 +645,27 @@ func (c *AirPlayClient) applyReceiverInfoUpdate(update map[string]interface{}, s
 	if _, ok := update["PTPInfo"]; ok {
 		info.hasPTPInfo = true
 	}
+	if _, ok := update["initialVolume"]; ok {
+		info.hasInitialVolume = true
+	}
 	c.info = &info
 	return &info, nil
+}
+
+// SetupVolume is the volume a session carrying audio opens with: the
+// receiver's own initialVolume, in AirPlay's -144..0 dB range. ok is false
+// when the receiver reports none (Roku TVs omit it) or reports a value outside
+// that range; the caller then leaves the receiver's volume untouched instead of
+// sending 0 dB, which is full scale and would force the TV to maximum.
+func (i *ReceiverInfo) SetupVolume() (float64, bool) {
+	if i == nil || !i.hasInitialVolume {
+		return 0, false
+	}
+	v := i.InitialVolume
+	if math.IsNaN(v) || v > 0 || v < -144 {
+		return 0, false
+	}
+	return v, true
 }
 
 func cloneAudioFormats(source map[string][]uint64) map[string][]uint64 {

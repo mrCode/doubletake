@@ -1142,18 +1142,23 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// state and should leave its volume untouched.
 	if cfg.NoAudio {
 		dbg("[SETUP] no-audio session: skipping SET_PARAMETER volume")
+	} else if setupVolume, ok := c.info.SetupVolume(); !ok {
+		// This sender has no volume slider of its own, so the only value that
+		// does not change the user's setting is the receiver's own. A receiver
+		// that does not report one keeps whatever it is set to.
+		dbg("[SETUP] receiver reports no initialVolume: leaving its volume untouched")
 	} else {
 		// Positive dB values are invalid here and current receivers may
 		// interpret them as zero gain. Real senders send the sender's own
-		// slider value; 0 dB is this sender's fixed choice.
-		volumeBody := audioVolumeBody(false)
+		// slider value; this one echoes the receiver's reported volume.
+		volumeBody := audioVolumeBodyDB(setupVolume)
 		if _, _, err := setupRTSPRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil); err != nil {
 			if !controlConnectionUsable {
 				return nil, fmt.Errorf("SET_PARAMETER volume: %w", err)
 			}
 			dbg("[SETUP] SET_PARAMETER volume failed (non-fatal): %v", err)
 		} else {
-			dbg("[SETUP] SET_PARAMETER volume=0 sent")
+			dbg("[SETUP] SET_PARAMETER volume=%.6f sent", setupVolume)
 		}
 		// Send volume twice (pcap shows real senders do this)
 		if _, _, err := setupRTSPRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil); err != nil && !controlConnectionUsable {
@@ -2456,6 +2461,10 @@ func audioVolumeBody(muted bool) []byte {
 		return []byte("volume: -144.000000\r\n")
 	}
 	return []byte("volume: 0.000000\r\n")
+}
+
+func audioVolumeBodyDB(db float64) []byte {
+	return []byte(fmt.Sprintf("volume: %.6f\r\n", db))
 }
 
 // AudioStream returns the audio stream for this session (may be nil).

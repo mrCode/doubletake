@@ -1025,7 +1025,38 @@ func TestSetupMirrorWithAudioSetsReceiverVolume(t *testing.T) {
 		{name: "skip record", skipRecord: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			testSetupMirrorAudioSessionNegotiation(t, audioSessionCase{skipRecord: test.skipRecord, noAudio: false})
+			volume := -20.0
+			testSetupMirrorAudioSessionNegotiation(t, audioSessionCase{skipRecord: test.skipRecord, noAudio: false, initialVolume: &volume})
+		})
+	}
+}
+
+// A receiver that reports no initialVolume (a Roku TV) keeps its
+// own volume. Sending 0 dB would force it to maximum on every connect.
+func TestSetupMirrorWithAudioLeavesVolumeWhenReceiverReportsNone(t *testing.T) {
+	testSetupMirrorAudioSessionNegotiation(t, audioSessionCase{skipRecord: false, noAudio: false})
+}
+
+func TestReceiverInfoSetupVolume(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		info   *ReceiverInfo
+		want   float64
+		wantOK bool
+	}{
+		{name: "nil info"},
+		{name: "not reported", info: &ReceiverInfo{}},
+		{name: "reported", info: &ReceiverInfo{InitialVolume: -20, hasInitialVolume: true}, want: -20, wantOK: true},
+		{name: "reported full scale", info: &ReceiverInfo{InitialVolume: 0, hasInitialVolume: true}, want: 0, wantOK: true},
+		{name: "reported muted", info: &ReceiverInfo{InitialVolume: -144, hasInitialVolume: true}, want: -144, wantOK: true},
+		{name: "positive is invalid", info: &ReceiverInfo{InitialVolume: 3, hasInitialVolume: true}},
+		{name: "below mute is invalid", info: &ReceiverInfo{InitialVolume: -200, hasInitialVolume: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := test.info.SetupVolume()
+			if got != test.want || ok != test.wantOK {
+				t.Fatalf("SetupVolume() = %v, %v; want %v, %v", got, ok, test.want, test.wantOK)
+			}
 		})
 	}
 }
@@ -1057,13 +1088,18 @@ func TestSetAudioMutedRefusesWhenSessionHasNoAudio(t *testing.T) {
 }
 
 type audioSessionCase struct {
-	skipRecord   bool
-	noAudio      bool
-	controlFirst bool
+	skipRecord    bool
+	noAudio       bool
+	controlFirst  bool
+	initialVolume *float64 // what the receiver reports in /info; nil = omitted
 }
 
 func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase) {
 	skipRecord, noAudio := test.skipRecord, test.noAudio
+	wantVolume := ""
+	if !noAudio && test.initialVolume != nil {
+		wantVolume = string(audioVolumeBodyDB(*test.initialVolume))
+	}
 	eventListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen event channel: %v", err)
@@ -1342,7 +1378,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 					return
 				}
 			case "SET_PARAMETER":
-				if string(req.body) != "volume: 0.000000\r\n" {
+				if wantVolume == "" || string(req.body) != wantVolume {
 					serverErr <- fmt.Errorf("unexpected SET_PARAMETER body %q", string(req.body))
 					return
 				}
@@ -1389,6 +1425,10 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 		screenStreamFormats = 0x800000 // deliberately unsupported
 	}
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: screenStreamFormats}}
+	if test.initialVolume != nil {
+		client.info.InitialVolume = *test.initialVolume
+		client.info.hasInitialVolume = true
+	}
 
 	session, err := client.SetupMirror(ctx, StreamConfig{FPS: 30, NoAudio: noAudio, NoEncrypt: true})
 	if err != nil {
@@ -1436,7 +1476,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 	// The two volume SET_PARAMETERs are sent only when the session carries
 	// audio: `volume: 0.000000` is 0 dB — full scale — so a video-only
 	// session would force the receiver to maximum.
-	if !noAudio {
+	if wantVolume != "" {
 		wantMethods = append(wantMethods, "SET_PARAMETER", "SET_PARAMETER")
 	}
 	wantMethods = append(wantMethods, "POST", "TEARDOWN")
