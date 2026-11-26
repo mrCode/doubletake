@@ -1489,6 +1489,7 @@ videoReady:
 	// take hundreds of milliseconds to deliver their first sample, which would
 	// otherwise make audio lead video by the same amount.
 	capture.DrainStale()
+	s.delayAudioCapture(ctx, capture) // see av_offset.go
 	frameBuf := make([]byte, 8192)
 	firstFrameSize := 0
 	var firstFramePosition audioPCMFramePosition

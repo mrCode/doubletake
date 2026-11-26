@@ -235,6 +235,8 @@ type MirrorSession struct {
 	frameClockNow      func() time.Time
 	timingProtocol     string
 	mediaClock         *mediaClock
+	avOffset           *avOffsetSource // see av_offset.go
+	videoLine          *videoDelayLine // see av_offset.go
 
 	// Audio
 	audioStream *AudioStream
@@ -1181,6 +1183,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		sessionURI:     audioURI,
 		timingConn:     timingConn,
 		timestampBias:  latencies.video,
+		avOffset:       newAVOffsetSource(cfg.AVOffsetFile),
 		timingProtocol: timingProtocol,
 		mediaClock:     clock,
 	}
@@ -1394,6 +1397,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 	if normalizeVideoCodec(s.videoCodec) == VideoCodecHEVC {
 		return s.streamHEVCFrames(ctx, capture, startDelay)
 	}
+	defer s.stopVideoDelayLine() // see av_offset.go
 	if startDelay > 0 {
 		dbg("[STREAM] waiting %v before sending first frame...", startDelay)
 		select {
@@ -1467,7 +1471,8 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			if frameCount < 20 {
 				dbg("[STREAM] sending codec frame avcC len=%d hdr=%02x", len(avcC), avcC[:min(8, len(avcC))])
 			}
-			if err := s.sendCodecFrame(avcC, packetTimestamp); err != nil {
+			codecTimestamp := packetTimestamp
+			if err := s.videoSend(func() error { return s.sendCodecFrame(avcC, codecTimestamp) }); err != nil {
 				return fmt.Errorf("send codec: %w", err)
 			}
 			codecSent = true
@@ -1498,7 +1503,10 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		nalLog.Reset()
 
 		sentPTS := vclPTS
-		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
+		// Copied, because vclBuf is reused while a delayed frame waits.
+		sendData, sendKey := append([]byte(nil), frameData...), pendingKeyframe
+		sendTimestamp, sendTimeline := packetTimestamp, packetTimeline
+		if err := s.videoSend(func() error { return s.sendFrame(sendData, sendKey, sendTimestamp, sendTimeline) }); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
 		}
 		// Codec configuration alone is not a displayed picture. Start audio and
@@ -2633,6 +2641,7 @@ func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, ti
 	if bias <= 0 {
 		bias = videoTimestampBias()
 	}
+	bias += s.videoDelay(now)
 	if !capturedAt.IsZero() {
 		age := now.Sub(capturedAt)
 		if age >= -time.Second && age <= 30*time.Second {

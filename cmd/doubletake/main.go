@@ -105,6 +105,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Send video frames unencrypted (debugging, or a receiver with neither an encrypted control channel nor FairPlay, which has no protected way to receive the video key)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
+	avOffsetFile := flag.String("av-offset-file", "", "File holding an audio/video sync offset in milliseconds, reread while casting: positive delays the audio, negative delays the video")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
@@ -551,6 +552,7 @@ func main() {
 		NoAudio:        *noAudio,
 		PortMin:        portMin,
 		PortMax:        portMax,
+		AVOffsetFile:   *avOffsetFile,
 	}
 	// Complete the potentially interactive Wayland portal request before SETUP,
 	// but delay encoder startup until control SETUP returns session-time display

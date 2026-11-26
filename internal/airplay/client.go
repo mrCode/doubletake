@@ -1358,6 +1358,7 @@ type StreamConfig struct {
 	NoEncrypt              bool          // Disable encryption for debugging
 	DirectKey              bool          // Use shk/shiv directly without SHA-512 derivation
 	NoAudio                bool          // Disable audio streaming
+	AVOffsetFile           string        // audio/video sync offset file, see av_offset.go
 
 	// PortMin/PortMax bound the local ports used for the audio UDP triple
 	// (timing/control/data, 3 consecutive ports). The receiver's event channel
